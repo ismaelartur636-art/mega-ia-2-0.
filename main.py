@@ -184,6 +184,33 @@ def install_iq_websocket_timeout():
 
 install_iq_websocket_timeout()
 
+# Registra apenas metadados de respostas inválidas, nunca corpo, cookies ou credenciais.
+def install_iq_json_diagnostics():
+    try:
+        import requests
+        original = requests.Response.json
+        if getattr(original, "_mega_json_diagnostics", False):
+            return
+        def json_with_diagnostics(response, *args, **kwargs):
+            try:
+                return original(response, *args, **kwargs)
+            except ValueError:
+                from urllib.parse import urlsplit
+                from threading import current_thread
+                # Não registra URL completa: query strings podem conter segredos.
+                host = urlsplit(response.url or "").hostname or "desconhecido"
+                content_type = (response.headers.get("Content-Type") or "desconhecido").split(";")[0][:64]
+                LOG.error("[IQ JSON] thread=%s host=%s http_status=%s content_type=%s bytes=%s",
+                          current_thread().name[:40], host, response.status_code,
+                          content_type, len(response.content or b""))
+                raise
+        json_with_diagnostics._mega_json_diagnostics = True
+        requests.Response.json = json_with_diagnostics
+    except Exception as exc:
+        LOG.warning("[IQ JSON] diagnóstico indisponível: %s", type(exc).__name__)
+
+install_iq_json_diagnostics()
+
 def login_blocking(email, password, cancelled, started):
     iq = None
     try:
@@ -244,6 +271,12 @@ def iq_login(body: Login):
             raise HTTPException(504, "IQ não respondeu em 35 segundos; etapa: " + stage + ". Consulte /iq-diagnostics.")
         except Exception as exc:
             iq_login_stage("connection_error", "failed_" + type(exc).__name__)
+            # Somente nomes de funções e módulos: traceback completo pode expor dados.
+            if type(exc).__name__ == "JSONDecodeError":
+                import traceback
+                frames = traceback.extract_tb(exc.__traceback__)
+                trace = " > ".join(f"{os.path.basename(f.filename)}:{f.name}:{f.lineno}" for f in frames[-9:])
+                LOG.error("[IQ JSON] origem=%s", trace[:650])
             LOG.warning("[IQ CONNECTOR] falha tipo=%s detalhe=%s", type(exc).__name__, str(exc)[:180])
             raise HTTPException(502, "Falha IQ (" + type(exc).__name__ + "). Consulte /iq-diagnostics e os logs.")
         if iq is None:
