@@ -49,23 +49,65 @@ def iq_diagnostics():
 
 @app.get("/iq-network-test")
 def iq_network_test():
-    """Teste de DNS/TCP/TLS sem login e sem expor credenciais."""
-    targets = ("iqoption.com", "ws.iqoption.com")
+    """Diagnóstico sem credenciais do host e WebSocket usados pela biblioteca."""
+    from urllib.parse import urlsplit
+    # A biblioteca comunitária usa normalmente iqoption.com/echo/websocket.
+    # A URL efetiva pode ser diferente em outras versões/forks instalados.
+    wss_url = "wss://iqoption.com/echo/websocket"
+    url_source = "referencia_iqoptionapi"
+    library_version = None
+    try:
+        import iqoptionapi.api as iq_api_module
+        import inspect, re
+        source = inspect.getsource(iq_api_module.IQOptionAPI.__init__)
+        match = re.search(r'wss://\{host\}(/[^\"\']+)', source)
+        if match:
+            wss_url = "wss://iqoption.com" + match.group(1)
+            url_source = "codigo_instalado"
+        else:
+            url_source = "referencia_nao_confirmada_no_codigo_instalado"
+        try:
+            from importlib.metadata import version
+            library_version = version("iqoptionapi")
+        except Exception:
+            pass
+    except Exception:
+        url_source = "referencia_biblioteca_indisponivel"
+    host = urlsplit(wss_url).hostname
     results = {}
-    for host in targets:
+    for target in ("iqoption.com", host):
+        if target in results:
+            continue
         result = {"dns": False, "tcp_443": False, "tls": False}
         try:
-            socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+            socket.getaddrinfo(target, 443, type=socket.SOCK_STREAM)
             result["dns"] = True
-            with socket.create_connection((host, 443), timeout=4) as raw:
+            with socket.create_connection((target, 443), timeout=4) as raw:
                 result["tcp_443"] = True
                 raw.settimeout(4)
-                with ssl.create_default_context().wrap_socket(raw, server_hostname=host):
+                with ssl.create_default_context().wrap_socket(raw, server_hostname=target):
                     result["tls"] = True
         except Exception as exc:
             result["error_type"] = type(exc).__name__
-        results[host] = result
-    return {"note": "Teste de conectividade, não valida login ou WebSocket da IQ.", "targets": results}
+        results[target] = result
+    ws = {"attempted": False, "handshake_ok": False}
+    try:
+        import websocket
+        ws["attempted"] = True
+        connection = websocket.create_connection(wss_url, timeout=5, enable_multithread=True)
+        try:
+            ws["handshake_ok"] = True
+        finally:
+            connection.close()
+    except Exception as exc:
+        ws["error_type"] = type(exc).__name__
+        # Nunca publicar mensagens de exceção que possam conter cookies ou credenciais.
+        ws["note"] = "Handshake não concluído; sem login, a corretora pode recusar a conexão."
+    return {"note": "Teste sem autenticação; sucesso no handshake não garante login.",
+            "iq_library": IQ_Option is not None,
+            "library_version": library_version,
+            "websocket_url": wss_url, "url_source": url_source,
+            "targets": results, "websocket": ws}
 
 MIN_CANDLES = 75
 PAIRS = {"EUR/USD":"EURUSD", "GBP/USD":"GBPUSD", "USD/JPY":"USDJPY", "EUR/JPY":"EURJPY", "GBP/JPY":"GBPJPY", "AUD/USD":"AUDUSD", "USD/CAD":"USDCAD"}
