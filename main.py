@@ -211,6 +211,52 @@ def install_iq_json_diagnostics():
 
 install_iq_json_diagnostics()
 
+def install_iq_reason_parser_fix():
+    """Evita JSONDecodeError quando a biblioteca tenta json.loads(reason).
+
+    Um motivo de erro não-JSON continua sendo uma falha de login, nunca sucesso.
+    Aplica-se apenas à função connect da versão instalada, se contiver o padrão.
+    """
+    if IQ_Option is None:
+        return
+    try:
+        import inspect, textwrap, json
+        original = IQ_Option.connect
+        if getattr(original, "_mega_reason_fixed", False):
+            return
+        source = textwrap.dedent(inspect.getsource(original))
+        needle = "json.loads(reason)"
+        if needle not in source:
+            LOG.info("[IQ REASON] versão não usa json.loads(reason); sem alteração")
+            return
+
+        def safe_reason_json(reason):
+            try:
+                parsed = json.loads(reason)
+            except (ValueError, TypeError):
+                # A biblioteca acessa ['code']; retornar código neutro evita
+                # o crash, mas mantém a decisão de autenticação como falha.
+                LOG.warning("[IQ REASON] resposta de erro não-JSON; tipo=%s tamanho=%s",
+                            type(reason).__name__, len(str(reason or "")))
+                return {"code": "unexpected_auth_response"}
+            if not isinstance(parsed, dict):
+                LOG.warning("[IQ REASON] resposta de erro JSON não é objeto")
+                return {"code": "unexpected_auth_response"}
+            return parsed
+
+        namespace = dict(original.__globals__)
+        namespace["_mega_safe_reason_json"] = safe_reason_json
+        source = source.replace(needle, "_mega_safe_reason_json(reason)")
+        exec(compile(source, "<iqoptionapi-connect-reason-fix>", "exec"), namespace)
+        fixed = namespace["connect"]
+        fixed._mega_reason_fixed = True
+        IQ_Option.connect = fixed
+        LOG.warning("[IQ REASON] correção para motivo de autenticação não-JSON ativada")
+    except Exception as exc:
+        LOG.warning("[IQ REASON] correção não aplicada: %s", type(exc).__name__)
+
+install_iq_reason_parser_fix()
+
 def login_blocking(email, password, cancelled, started):
     iq = None
     try:
