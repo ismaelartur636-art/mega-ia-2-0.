@@ -1,5 +1,5 @@
 """MEGA IA Parceiro 2.0 - projeto novo, motor Scalping M1 FLEX."""
-import os, time, secrets, threading, logging
+import os, time, secrets, threading, logging, socket, ssl
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from zoneinfo import ZoneInfo
@@ -23,6 +23,7 @@ LOGIN_TIMEOUT = 35
 IQ_LOGIN_GUARD = threading.Lock()
 IQ_LOGIN_STATE_LOCK = threading.Lock()
 IQ_LOGIN_STATE = {"stage":"idle", "started":None, "elapsed":None, "result":"not_started"}
+IQ_LOGIN_WORKER = {"future": None}
 
 def iq_login_stage(stage, result="running", started=None):
     with IQ_LOGIN_STATE_LOCK:
@@ -37,8 +38,34 @@ def iq_login_stage(stage, result="running", started=None):
 def iq_diagnostics():
     with IQ_LOGIN_STATE_LOCK:
         info = dict(IQ_LOGIN_STATE)
-    info.pop("started", None)
-    return {"iq_library": IQ_Option is not None, "login": info, "timeout_seconds": LOGIN_TIMEOUT}
+    started = info.pop("started", None)
+    if started is not None:
+        info["elapsed"] = round(time.monotonic() - started, 1)
+    worker = IQ_LOGIN_WORKER.get("future")
+    return {"iq_library": IQ_Option is not None, "login": info,
+            "login_busy": IQ_LOGIN_GUARD.locked(),
+            "worker_running": bool(worker and not worker.done()),
+            "timeout_seconds": LOGIN_TIMEOUT}
+
+@app.get("/iq-network-test")
+def iq_network_test():
+    """Teste de DNS/TCP/TLS sem login e sem expor credenciais."""
+    targets = ("iqoption.com", "ws.iqoption.com")
+    results = {}
+    for host in targets:
+        result = {"dns": False, "tcp_443": False, "tls": False}
+        try:
+            socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+            result["dns"] = True
+            with socket.create_connection((host, 443), timeout=4) as raw:
+                result["tcp_443"] = True
+                raw.settimeout(4)
+                with ssl.create_default_context().wrap_socket(raw, server_hostname=host):
+                    result["tls"] = True
+        except Exception as exc:
+            result["error_type"] = type(exc).__name__
+        results[host] = result
+    return {"note": "Teste de conectividade, não valida login ou WebSocket da IQ.", "targets": results}
 
 MIN_CANDLES = 75
 PAIRS = {"EUR/USD":"EURUSD", "GBP/USD":"GBPUSD", "USD/JPY":"USDJPY", "EUR/JPY":"EURJPY", "GBP/JPY":"GBPJPY", "AUD/USD":"AUDUSD", "USD/CAD":"USDCAD"}
@@ -78,6 +105,7 @@ def login_blocking(email, password, cancelled, started):
             return None
         if not ok:
             iq_login_stage("connection_rejected", "failed")
+            LOG.warning("[IQ CONNECTOR] connect retornou falha: %s", str(reason)[:180])
             raise RuntimeError("IQ não concluiu a autenticação ou WebSocket: " + str(reason)[:120])
         iq_login_stage("checking_websocket")
         if not iq.check_connect():
@@ -107,6 +135,7 @@ def iq_login(body: Login):
     try:
         iq_login_stage("queued", started=started)
         future = POOL.submit(login_blocking, body.email, body.password, cancelled, started)
+        IQ_LOGIN_WORKER["future"] = future
         # O guard só é liberado quando o worker realmente terminar, mesmo após timeout.
         future.add_done_callback(lambda _future: IQ_LOGIN_GUARD.release())
         try:
@@ -120,7 +149,7 @@ def iq_login(body: Login):
             raise HTTPException(504, "IQ não respondeu em 35 segundos; etapa: " + stage + ". Consulte /iq-diagnostics.")
         except Exception as exc:
             iq_login_stage("connection_error", "failed_" + type(exc).__name__)
-            LOG.warning("[IQ CONNECTOR] falha tipo=%s", type(exc).__name__)
+            LOG.warning("[IQ CONNECTOR] falha tipo=%s detalhe=%s", type(exc).__name__, str(exc)[:180])
             raise HTTPException(502, "Falha IQ (" + type(exc).__name__ + "). Consulte /iq-diagnostics e os logs.")
         if iq is None:
             raise HTTPException(504, "A tentativa IQ expirou.")
