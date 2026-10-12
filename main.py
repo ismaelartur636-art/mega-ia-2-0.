@@ -1,5 +1,5 @@
 """MEGA IA Parceiro 2.0 - projeto novo, motor Scalping M1 FLEX."""
-import os, time, secrets, threading, logging, socket, ssl
+import os, time, secrets, threading, logging, socket, ssl, re
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from zoneinfo import ZoneInfo
@@ -22,7 +22,7 @@ SESSION_TTL = 12 * 3600
 LOGIN_TIMEOUT = 35
 IQ_LOGIN_GUARD = threading.Lock()
 IQ_LOGIN_STATE_LOCK = threading.Lock()
-IQ_LOGIN_STATE = {"stage":"idle", "started":None, "elapsed":None, "result":"not_started"}
+IQ_LOGIN_STATE = {"stage":"idle", "started":None, "elapsed":None, "result":"not_started", "error_code":None}
 IQ_LOGIN_WORKER = {"future": None}
 
 def iq_login_stage(stage, result="running", started=None):
@@ -39,7 +39,7 @@ def iq_diagnostics():
     with IQ_LOGIN_STATE_LOCK:
         info = dict(IQ_LOGIN_STATE)
     started = info.pop("started", None)
-    if started is not None:
+    if started is not None and info.get("result") in ("running", "timed_out_worker_may_still_be_running"):
         info["elapsed"] = round(time.monotonic() - started, 1)
     worker = IQ_LOGIN_WORKER.get("future")
     return {"iq_library": IQ_Option is not None, "login": info,
@@ -257,6 +257,25 @@ def install_iq_reason_parser_fix():
 
 install_iq_reason_parser_fix()
 
+def iq_error_code(reason):
+    """Classificação sem expor texto de resposta, e-mail, senha ou tokens."""
+    msg = str(reason or "").lower()
+    if any(x in msg for x in ("invalid_credentials", "invalid credentials", "wrong password", "incorrect password")):
+        return "invalid_credentials"
+    if any(x in msg for x in ("2fa", "two_factor", "two-factor", "verification code")):
+        return "verification_required"
+    if any(x in msg for x in ("captcha", "cloudflare", "challenge", "403", "forbidden", "access denied")):
+        return "security_challenge_or_access_denied"
+    if any(x in msg for x in ("429", "too many", "rate limit")):
+        return "rate_limited"
+    if any(x in msg for x in ("timed out", "timeout", "time out")):
+        return "network_timeout"
+    if any(x in msg for x in ("websocket", "handshake", "connection closed")):
+        return "websocket_failure"
+    if any(x in msg for x in ("json", "expecting value", "unexpected_auth_response")):
+        return "unexpected_auth_response"
+    return "unknown_connection_failure"
+
 def login_blocking(email, password, cancelled, started):
     iq = None
     try:
@@ -273,8 +292,11 @@ def login_blocking(email, password, cancelled, started):
             return None
         if not ok:
             iq_login_stage("connection_rejected", "failed")
-            LOG.warning("[IQ CONNECTOR] connect retornou falha: %s", str(reason)[:180])
-            raise RuntimeError("IQ não concluiu a autenticação ou WebSocket: " + str(reason)[:120])
+            code = iq_error_code(reason)
+            with IQ_LOGIN_STATE_LOCK:
+                IQ_LOGIN_STATE["error_code"] = code
+            LOG.warning("[IQ CONNECTOR] connect retornou falha classificada=%s tipo=%s", code, type(reason).__name__)
+            raise RuntimeError("Falha na conexão IQ: " + code)
         iq_login_stage("checking_websocket")
         if not iq.check_connect():
             iq_login_stage("websocket_not_confirmed", "failed")
@@ -282,6 +304,8 @@ def login_blocking(email, password, cancelled, started):
         if cancelled.is_set():
             iq_login_stage("late_response_discarded", "timed_out")
             return None
+        with IQ_LOGIN_STATE_LOCK:
+            IQ_LOGIN_STATE["error_code"] = None
         iq_login_stage("connected", "success")
         return iq
     finally:
@@ -301,6 +325,8 @@ def iq_login(body: Login):
     started = time.monotonic()
     cancelled = threading.Event()
     try:
+        with IQ_LOGIN_STATE_LOCK:
+            IQ_LOGIN_STATE["error_code"] = None
         iq_login_stage("queued", started=started)
         future = POOL.submit(login_blocking, body.email, body.password, cancelled, started)
         IQ_LOGIN_WORKER["future"] = future
@@ -316,6 +342,10 @@ def iq_login(body: Login):
             LOG.warning("[IQ CONNECTOR] timeout %ss etapa=%s; aguardando worker encerrar", LOGIN_TIMEOUT, stage)
             raise HTTPException(504, "IQ não respondeu em 35 segundos; etapa: " + stage + ". Consulte /iq-diagnostics.")
         except Exception as exc:
+            code = iq_error_code(exc)
+            with IQ_LOGIN_STATE_LOCK:
+                if IQ_LOGIN_STATE.get("error_code") is None:
+                    IQ_LOGIN_STATE["error_code"] = code
             iq_login_stage("connection_error", "failed_" + type(exc).__name__)
             # Somente nomes de funções e módulos: traceback completo pode expor dados.
             if type(exc).__name__ == "JSONDecodeError":
@@ -324,7 +354,7 @@ def iq_login(body: Login):
                 trace = " > ".join(f"{os.path.basename(f.filename)}:{f.name}:{f.lineno}" for f in frames[-9:])
                 LOG.error("[IQ JSON] origem=%s", trace[:650])
             LOG.warning("[IQ CONNECTOR] falha tipo=%s detalhe=%s", type(exc).__name__, str(exc)[:180])
-            raise HTTPException(502, "Falha IQ (" + type(exc).__name__ + "). Consulte /iq-diagnostics e os logs.")
+            raise HTTPException(502, "Falha IQ: " + IQ_LOGIN_STATE.get("error_code", "unknown_connection_failure") + ". Consulte /iq-diagnostics e os logs.")
         if iq is None:
             raise HTTPException(504, "A tentativa IQ expirou.")
         token = secrets.token_urlsafe(40)
