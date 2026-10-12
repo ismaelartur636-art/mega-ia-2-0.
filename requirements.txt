@@ -4,3 +4,4 @@ pydantic>=2,<3
 websocket-client>=1.8,<2
 # iqoptionapi precisa ser instalada a partir de uma fonte auditada e compatível.
 # Não há pacote oficial garantido da IQ Option para esta integração.
+git+https://github.com/iqoptionapi/iqoptionapi.git
