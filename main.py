@@ -20,6 +20,26 @@ LOCK = threading.RLock()
 POOL = ThreadPoolExecutor(max_workers=4)
 SESSION_TTL = 12 * 3600
 LOGIN_TIMEOUT = 35
+IQ_LOGIN_GUARD = threading.Lock()
+IQ_LOGIN_STATE_LOCK = threading.Lock()
+IQ_LOGIN_STATE = {"stage":"idle", "started":None, "elapsed":None, "result":"not_started"}
+
+def iq_login_stage(stage, result="running", started=None):
+    with IQ_LOGIN_STATE_LOCK:
+        IQ_LOGIN_STATE.update(stage=stage, result=result)
+        if started is not None:
+            IQ_LOGIN_STATE["started"] = started
+        if IQ_LOGIN_STATE.get("started") is not None:
+            IQ_LOGIN_STATE["elapsed"] = round(time.monotonic()-IQ_LOGIN_STATE["started"], 1)
+    LOG.info("[IQ CONNECTOR] etapa=%s resultado=%s", stage, result)
+
+@app.get("/iq-diagnostics")
+def iq_diagnostics():
+    with IQ_LOGIN_STATE_LOCK:
+        info = dict(IQ_LOGIN_STATE)
+    info.pop("started", None)
+    return {"iq_library": IQ_Option is not None, "login": info, "timeout_seconds": LOGIN_TIMEOUT}
+
 MIN_CANDLES = 75
 PAIRS = {"EUR/USD":"EURUSD", "GBP/USD":"GBPUSD", "USD/JPY":"USDJPY", "EUR/JPY":"EURJPY", "GBP/JPY":"GBPJPY", "AUD/USD":"AUDUSD", "USD/CAD":"USDCAD"}
 
@@ -42,30 +62,81 @@ def session(request: Request, required=True):
 def call_timeout(fn, *args, seconds=12):
     return POOL.submit(fn,*args).result(timeout=seconds)
 
-def login_blocking(email,password):
-    iq=IQ_Option(email,password)
-    ok,reason=iq.connect()
-    if not ok:raise RuntimeError("IQ Option recusou ou não concluiu a autenticação: "+str(reason)[:130])
-    if not iq.check_connect():raise RuntimeError("IQ Option não confirmou o WebSocket.")
-    return iq
+def login_blocking(email, password, cancelled, started):
+    iq = None
+    try:
+        iq_login_stage("creating_client", started=started)
+        iq = IQ_Option(email, password)
+        if cancelled.is_set():
+            return None
+        iq_login_stage("connect_authentication_websocket")
+        # A biblioteca executa autenticação e abertura de WebSocket dentro de connect().
+        # Sem instrumentar a biblioteca não é possível distinguir essas subetapas.
+        ok, reason = iq.connect()
+        if cancelled.is_set():
+            iq_login_stage("late_response_discarded", "timed_out")
+            return None
+        if not ok:
+            iq_login_stage("connection_rejected", "failed")
+            raise RuntimeError("IQ não concluiu a autenticação ou WebSocket: " + str(reason)[:120])
+        iq_login_stage("checking_websocket")
+        if not iq.check_connect():
+            iq_login_stage("websocket_not_confirmed", "failed")
+            raise RuntimeError("IQ não confirmou o WebSocket")
+        if cancelled.is_set():
+            iq_login_stage("late_response_discarded", "timed_out")
+            return None
+        iq_login_stage("connected", "success")
+        return iq
+    finally:
+        if cancelled.is_set() and iq is not None:
+            try:
+                iq.close_connect()
+            except Exception:
+                pass
 
 @app.post('/iq-login')
 def iq_login(body: Login):
-    if IQ_Option is None:raise HTTPException(503,"Biblioteca iqoptionapi não instalada no servidor.")
+    if IQ_Option is None:
+        raise HTTPException(503, "Biblioteca iqoptionapi não instalada no servidor.")
+    # Bloqueia tentativas simultâneas: uma chamada presa não deve criar outras.
+    if not IQ_LOGIN_GUARD.acquire(blocking=False):
+        raise HTTPException(429, "Uma tentativa IQ ainda está em andamento. Aguarde a conclusão antes de tentar novamente.")
+    started = time.monotonic()
+    cancelled = threading.Event()
     try:
-        iq=call_timeout(login_blocking,body.email,body.password,seconds=LOGIN_TIMEOUT)
-    except FutureTimeout:
-        LOG.warning("[IQ CONNECTOR] timeout de %ss na autenticação/WebSocket",LOGIN_TIMEOUT)
-        raise HTTPException(504,"IQ Option não respondeu em 35 segundos. Verifique os logs do conector.")
-    except Exception as exc:
-        LOG.warning("[IQ CONNECTOR] login falhou: %s",type(exc).__name__)
-        raise HTTPException(502,"Falha na conexão IQ: "+str(exc)[:170])
-    token=secrets.token_urlsafe(40)
-    with LOCK:
-        SESSIONS[token]={"iq":iq,"created":time.time(),"mode":"RECOVERY","last_signal":{},"active":{},"history":[],"last_poll":{},"last_error":""}
-    response=JSONResponse({"connected":True,"message":"IQ Option conectada"})
-    response.set_cookie("mega_iq_session",token,httponly=True,secure=True,samesite="lax",max_age=SESSION_TTL)
-    return response
+        iq_login_stage("queued", started=started)
+        future = POOL.submit(login_blocking, body.email, body.password, cancelled, started)
+        # O guard só é liberado quando o worker realmente terminar, mesmo após timeout.
+        future.add_done_callback(lambda _future: IQ_LOGIN_GUARD.release())
+        try:
+            iq = future.result(timeout=LOGIN_TIMEOUT)
+        except FutureTimeout:
+            cancelled.set()
+            with IQ_LOGIN_STATE_LOCK:
+                stage = IQ_LOGIN_STATE.get("stage", "unknown")
+            iq_login_stage(stage, "timed_out_worker_may_still_be_running")
+            LOG.warning("[IQ CONNECTOR] timeout %ss etapa=%s; aguardando worker encerrar", LOGIN_TIMEOUT, stage)
+            raise HTTPException(504, "IQ não respondeu em 35 segundos; etapa: " + stage + ". Consulte /iq-diagnostics.")
+        except Exception as exc:
+            iq_login_stage("connection_error", "failed_" + type(exc).__name__)
+            LOG.warning("[IQ CONNECTOR] falha tipo=%s", type(exc).__name__)
+            raise HTTPException(502, "Falha IQ (" + type(exc).__name__ + "). Consulte /iq-diagnostics e os logs.")
+        if iq is None:
+            raise HTTPException(504, "A tentativa IQ expirou.")
+        token = secrets.token_urlsafe(40)
+        with LOCK:
+            SESSIONS[token] = {"iq": iq, "created": time.time(), "mode": "RECOVERY", "last_signal": {}, "active": {}, "history": [], "last_poll": {}, "last_error": ""}
+        response = JSONResponse({"connected": True, "message": "IQ Option conectada"})
+        response.set_cookie("mega_iq_session", token, httponly=True, secure=True, samesite="lax", max_age=SESSION_TTL)
+        return response
+    except HTTPException:
+        raise
+    # Guard pertence ao callback do Future; só liberar diretamente se submit falhou.
+    except Exception:
+        if 'future' not in locals():
+            IQ_LOGIN_GUARD.release()
+        raise
 
 @app.post('/iq-logout')
 def iq_logout(request:Request):
