@@ -131,6 +131,59 @@ def session(request: Request, required=True):
 def call_timeout(fn, *args, seconds=12):
     return POOL.submit(fn,*args).result(timeout=seconds)
 
+def install_iq_websocket_timeout():
+    """Remove o loop infinito de abertura do WebSocket da iqoptionapi antiga."""
+    if IQ_Option is None:
+        return
+    try:
+        from iqoptionapi.api import IQOptionAPI
+        from iqoptionapi.ws.client import WebsocketClient
+        from iqoptionapi import global_value
+        import inspect
+        if getattr(IQOptionAPI.start_websocket, "_mega_bounded", False):
+            return
+
+        def bounded_start_websocket(self):
+            global_value.check_websocket_if_connect = None
+            global_value.check_websocket_if_error = False
+            global_value.websocket_error_reason = None
+            self.websocket_client = WebsocketClient(self)
+            self.websocket_thread = threading.Thread(
+                target=self.websocket.run_forever,
+                kwargs={"sslopt": {"check_hostname": False, "cert_reqs": ssl.CERT_NONE}},
+                daemon=True,
+            )
+            self.websocket_thread.start()
+            deadline = time.monotonic() + 12
+            while time.monotonic() < deadline:
+                if global_value.check_websocket_if_error:
+                    return False, str(global_value.websocket_error_reason or "Erro WebSocket")[:180]
+                if global_value.check_websocket_if_connect == 0:
+                    return False, "WebSocket encerrado pelo servidor"
+                if global_value.check_websocket_if_connect == 1:
+                    return True, None
+                if not self.websocket_thread.is_alive():
+                    return False, "Thread WebSocket terminou sem conectar"
+                time.sleep(0.1)
+            try:
+                self.websocket.close()
+            except Exception:
+                pass
+            return False, "WebSocket não abriu em 12s (rede, handshake ou bloqueio do servidor)"
+
+        # Compatível com a implementação clássica (flags globais) da biblioteca.
+        source = inspect.getsource(IQOptionAPI.start_websocket)
+        if "global_value.check_websocket_if_connect" not in source or "self.websocket_client" not in source:
+            LOG.warning("[IQ CONNECTOR] versão diferente: patch WebSocket não aplicado")
+            return
+        bounded_start_websocket._mega_bounded = True
+        IQOptionAPI.start_websocket = bounded_start_websocket
+        LOG.warning("[IQ CONNECTOR] timeout interno WebSocket 12s ativado")
+    except Exception as exc:
+        LOG.warning("[IQ CONNECTOR] não foi possível ativar timeout interno: %s", type(exc).__name__)
+
+install_iq_websocket_timeout()
+
 def login_blocking(email, password, cancelled, started):
     iq = None
     try:
