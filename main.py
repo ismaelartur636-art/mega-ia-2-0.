@@ -182,7 +182,11 @@ def install_iq_websocket_timeout():
     except Exception as exc:
         LOG.warning("[IQ CONNECTOR] não foi possível ativar timeout interno: %s", type(exc).__name__)
 
-install_iq_websocket_timeout()
+# A versão 3.99.72 utilizava o start_websocket original da iqoptionapi.
+# Não substituir globalmente o método: o patch antigo alterava a negociação
+# do WebSocket e desabilitava a validação TLS, dificultando a autenticação.
+# O timeout externo de /iq-login continua ativo.
+LOG.info("[IQ CONNECTOR] WebSocket original da biblioteca preservado")
 
 # Registra apenas metadados de respostas inválidas, nunca corpo, cookies ou credenciais.
 def install_iq_json_diagnostics():
@@ -280,13 +284,18 @@ def login_blocking(email, password, cancelled, started):
     iq = None
     try:
         iq_login_stage("creating_client", started=started)
-        iq = IQ_Option(email, password)
+        iq = IQ_Option(email.strip(), password)
         if cancelled.is_set():
             return None
         iq_login_stage("connect_authentication_websocket")
         # A biblioteca executa autenticação e abertura de WebSocket dentro de connect().
         # Sem instrumentar a biblioteca não é possível distinguir essas subetapas.
-        ok, reason = iq.connect()
+        connect_result = iq.connect()
+        if isinstance(connect_result, (tuple, list)):
+            ok = bool(connect_result[0]) if connect_result else False
+            reason = connect_result[1] if len(connect_result) > 1 else ""
+        else:
+            ok, reason = bool(connect_result), ""
         if cancelled.is_set():
             iq_login_stage("late_response_discarded", "timed_out")
             return None
