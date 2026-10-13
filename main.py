@@ -131,57 +131,6 @@ def session(request: Request, required=True):
 def call_timeout(fn, *args, seconds=12):
     return POOL.submit(fn,*args).result(timeout=seconds)
 
-def install_iq_websocket_timeout():
-    """Remove o loop infinito de abertura do WebSocket da iqoptionapi antiga."""
-    if IQ_Option is None:
-        return
-    try:
-        from iqoptionapi.api import IQOptionAPI
-        from iqoptionapi.ws.client import WebsocketClient
-        from iqoptionapi import global_value
-        import inspect
-        if getattr(IQOptionAPI.start_websocket, "_mega_bounded", False):
-            return
-
-        def bounded_start_websocket(self):
-            global_value.check_websocket_if_connect = None
-            global_value.check_websocket_if_error = False
-            global_value.websocket_error_reason = None
-            self.websocket_client = WebsocketClient(self)
-            self.websocket_thread = threading.Thread(
-                target=self.websocket.run_forever,
-                kwargs={"sslopt": {"check_hostname": False, "cert_reqs": ssl.CERT_NONE}},
-                daemon=True,
-            )
-            self.websocket_thread.start()
-            deadline = time.monotonic() + 12
-            while time.monotonic() < deadline:
-                if global_value.check_websocket_if_error:
-                    return False, str(global_value.websocket_error_reason or "Erro WebSocket")[:180]
-                if global_value.check_websocket_if_connect == 0:
-                    return False, "WebSocket encerrado pelo servidor"
-                if global_value.check_websocket_if_connect == 1:
-                    return True, None
-                if not self.websocket_thread.is_alive():
-                    return False, "Thread WebSocket terminou sem conectar"
-                time.sleep(0.1)
-            try:
-                self.websocket.close()
-            except Exception:
-                pass
-            return False, "WebSocket não abriu em 12s (rede, handshake ou bloqueio do servidor)"
-
-        # Compatível com a implementação clássica (flags globais) da biblioteca.
-        source = inspect.getsource(IQOptionAPI.start_websocket)
-        if "global_value.check_websocket_if_connect" not in source or "self.websocket_client" not in source:
-            LOG.warning("[IQ CONNECTOR] versão diferente: patch WebSocket não aplicado")
-            return
-        bounded_start_websocket._mega_bounded = True
-        IQOptionAPI.start_websocket = bounded_start_websocket
-        LOG.warning("[IQ CONNECTOR] timeout interno WebSocket 12s ativado")
-    except Exception as exc:
-        LOG.warning("[IQ CONNECTOR] não foi possível ativar timeout interno: %s", type(exc).__name__)
-
 # A versão 3.99.72 utilizava o start_websocket original da iqoptionapi.
 # Não substituir globalmente o método: o patch antigo alterava a negociação
 # do WebSocket e desabilitava a validação TLS, dificultando a autenticação.
@@ -280,11 +229,28 @@ def iq_error_code(reason):
         return "unexpected_auth_response"
     return "unknown_connection_failure"
 
-def login_blocking(email, password, cancelled, started):
+def abort_iq_client(client):
+    """Encerra HTTP/socket usando os métodos disponíveis na biblioteca instalada."""
+    if client is None:
+        return
+    api = getattr(client, "api", None)
+    for target in (client, api, getattr(api, "websocket", None)):
+        for name in ("close_connect", "close"):
+            close = getattr(target, name, None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+                break
+
+def login_blocking(email, password, cancelled, started, attempt):
     iq = None
+    accepted = False
     try:
         iq_login_stage("creating_client", started=started)
         iq = IQ_Option(email.strip(), password)
+        attempt["client"] = iq
         if cancelled.is_set():
             return None
         iq_login_stage("connect_authentication_websocket")
@@ -316,28 +282,36 @@ def login_blocking(email, password, cancelled, started):
         with IQ_LOGIN_STATE_LOCK:
             IQ_LOGIN_STATE["error_code"] = None
         iq_login_stage("connected", "success")
+        accepted = True
         return iq
     finally:
-        if cancelled.is_set() and iq is not None:
-            try:
-                iq.close_connect()
-            except Exception:
-                pass
+        if not accepted:
+            abort_iq_client(iq)
 
 @app.post('/iq-login')
-def iq_login(body: Login):
+def iq_login(body: Login, request: Request):
     if IQ_Option is None:
         raise HTTPException(503, "Biblioteca iqoptionapi não instalada no servidor.")
+    if not body.email.strip() or not body.password:
+        raise HTTPException(400, "Informe e-mail e senha da IQ Option.")
+    existing = session(request, required=False)
+    if existing and existing.get("email") == body.email.strip().casefold():
+        try:
+            if call_timeout(existing["iq"].check_connect, seconds=3):
+                return JSONResponse({"connected": True, "message": "Sessão IQ Option já conectada"})
+        except Exception:
+            pass
     # Bloqueia tentativas simultâneas: uma chamada presa não deve criar outras.
     if not IQ_LOGIN_GUARD.acquire(blocking=False):
         raise HTTPException(429, "Uma tentativa IQ ainda está em andamento. Aguarde a conclusão antes de tentar novamente.")
     started = time.monotonic()
     cancelled = threading.Event()
+    attempt = {"client": None}
     try:
         with IQ_LOGIN_STATE_LOCK:
             IQ_LOGIN_STATE["error_code"] = None
         iq_login_stage("queued", started=started)
-        future = POOL.submit(login_blocking, body.email, body.password, cancelled, started)
+        future = POOL.submit(login_blocking, body.email, body.password, cancelled, started, attempt)
         IQ_LOGIN_WORKER["future"] = future
         # O guard só é liberado quando o worker realmente terminar, mesmo após timeout.
         future.add_done_callback(lambda _future: IQ_LOGIN_GUARD.release())
@@ -345,6 +319,7 @@ def iq_login(body: Login):
             iq = future.result(timeout=LOGIN_TIMEOUT)
         except FutureTimeout:
             cancelled.set()
+            threading.Thread(target=abort_iq_client, args=(attempt["client"],), daemon=True, name="iq-timeout-close").start()
             with IQ_LOGIN_STATE_LOCK:
                 stage = IQ_LOGIN_STATE.get("stage", "unknown")
             iq_login_stage(stage, "timed_out_worker_may_still_be_running")
@@ -368,7 +343,7 @@ def iq_login(body: Login):
             raise HTTPException(504, "A tentativa IQ expirou.")
         token = secrets.token_urlsafe(40)
         with LOCK:
-            SESSIONS[token] = {"iq": iq, "created": time.time(), "mode": "RECOVERY", "last_signal": {}, "active": {}, "history": [], "last_poll": {}, "last_error": ""}
+            SESSIONS[token] = {"iq": iq, "email": body.email.strip().casefold(), "created": time.time(), "mode": "RECOVERY", "last_signal": {}, "active": {}, "history": [], "last_poll": {}, "last_error": ""}
         response = JSONResponse({"connected": True, "message": "IQ Option conectada"})
         response.set_cookie("mega_iq_session", token, httponly=True, secure=True, samesite="lax", max_age=SESSION_TTL)
         return response
