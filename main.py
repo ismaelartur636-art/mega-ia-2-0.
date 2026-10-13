@@ -629,3 +629,53 @@ def health():return {'ok':True,'version':'2.0.0','iq_library':IQ_Option is not N
 @app.get('/',response_class=HTMLResponse)
 def index():
     with open(os.path.join(os.path.dirname(__file__),'index.html'),encoding='utf8') as f:return HTMLResponse(f.read())
+
+@app.get('/iq-files-check')
+def iq_files_check():
+    """Somente leitura: não exibe credenciais, variáveis ou conteúdo dos arquivos."""
+    import importlib.metadata
+    import inspect
+    from pathlib import Path
+    result = {"diagnostic_version": "files-1", "iq_library_loaded": IQ_Option is not None}
+    versions = {}
+    for name in ("websocket-client", "requests", "certifi", "iqoptionapi"):
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            versions[name] = "not_found"
+    result["versions"] = versions
+    def certificate_status(path):
+        path = Path(path)
+        exists = path.is_file()
+        info = {"exists": exists, "readable": exists and os.access(path, os.R_OK)}
+        if info["readable"]:
+            try:
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                context.load_verify_locations(cafile=str(path))
+                info["valid_ca_bundle"] = True
+            except Exception as exc:
+                info["valid_ca_bundle"] = False
+                info["error_type"] = type(exc).__name__
+        return info
+    result["certificates"] = {
+        "working_directory_cacert": certificate_status(Path.cwd() / "cacert.pem"),
+        "main_directory_cacert": certificate_status(Path(__file__).resolve().parent / "cacert.pem"),
+        "render_secret_cacert": certificate_status("/etc/secrets/cacert.pem"),
+    }
+    try:
+        import certifi
+        result["certificates"]["certifi_bundle"] = certificate_status(certifi.where())
+    except ImportError:
+        result["certificates"]["certifi_bundle"] = {"exists": False}
+    try:
+        from iqoptionapi import api as iq_api
+        source = inspect.getsource(iq_api)
+        result["library_references_relative_cacert"] = "cacert.pem" in source
+        result["internal_deadlines"] = {
+            name: bool(getattr(getattr(iq_api.IQOptionAPI, name, None), "_mega_deadline", False))
+            for name in ("start_websocket", "send_ssid", "connect")
+        }
+    except Exception as exc:
+        result["inspection_error_type"] = type(exc).__name__
+    result["note"] = "Certificado ausente é uma pista; este teste não comprova a causa do timeout de rede."
+    return result
