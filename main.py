@@ -202,6 +202,7 @@ def install_iq_reason_parser_fix():
         source = source.replace(needle, "_mega_safe_reason_json(reason)")
         exec(compile(source, "<iqoptionapi-connect-reason-fix>", "exec"), namespace)
         fixed = namespace["connect"]
+        fixed._mega_source = source
         fixed._mega_reason_fixed = True
         IQ_Option.connect = fixed
         LOG.warning("[IQ REASON] correção para motivo de autenticação não-JSON ativada")
@@ -228,6 +229,69 @@ def iq_error_code(reason):
     if any(x in msg for x in ("json", "expecting value", "unexpected_auth_response")):
         return "unexpected_auth_response"
     return "unknown_connection_failure"
+
+IQ_CONNECT_CONTEXT = threading.local()
+
+def iq_wait_checkpoint(stage):
+    context = getattr(IQ_CONNECT_CONTEXT, "attempt", None)
+    if context is None:
+        return
+    if context["stage"] != stage:
+        context["stage"] = stage
+        iq_login_stage(stage)
+    if context["cancelled"].is_set() or time.monotonic() >= context["deadline"]:
+        raise TimeoutError("IQ aguardando resposta em " + stage)
+    time.sleep(0.02)
+
+def install_iq_internal_deadlines():
+    """Acrescenta prazo às esperas, preservando o protocolo da versão instalada."""
+    if IQ_Option is None:
+        return
+    import ast, inspect, textwrap
+    from iqoptionapi.api import IQOptionAPI
+    for cls, method in ((IQOptionAPI, "start_websocket"),
+                        (IQOptionAPI, "send_ssid"),
+                        (IQOptionAPI, "connect"),
+                        (IQ_Option, "connect")):
+        original = getattr(cls, method, None)
+        if original is None or getattr(original, "_mega_deadline", False):
+            continue
+        try:
+            source = getattr(original, "_mega_source", None)
+            if source is None:
+                source = textwrap.dedent(inspect.getsource(original))
+            tree = ast.parse(source)
+            function = tree.body[0]
+            if not isinstance(function, ast.FunctionDef):
+                raise ValueError("unsupported method")
+            function.decorator_list = []
+            count = [0]
+            class BoundLoops(ast.NodeTransformer):
+                def visit_While(self, node):
+                    self.generic_visit(node)
+                    count[0] += 1
+                    stage = "iq_" + method + "_wait_" + str(count[0])
+                    checkpoint = ast.Expr(value=ast.Call(
+                        func=ast.Name(id="_mega_wait_checkpoint", ctx=ast.Load()),
+                        args=[ast.Constant(value=stage)], keywords=[]))
+                    # Antes do try da biblioteca: não deixar except/pass engolir timeout.
+                    node.body.insert(0, checkpoint)
+                    return node
+            BoundLoops().visit(function)
+            if not count[0]:
+                continue
+            ast.fix_missing_locations(tree)
+            namespace = dict(original.__globals__)
+            namespace["_mega_wait_checkpoint"] = iq_wait_checkpoint
+            exec(compile(tree, "<mega-iq-deadline-" + method + ">", "exec"), namespace)
+            fixed = namespace[method]
+            fixed._mega_deadline = True
+            setattr(cls, method, fixed)
+            LOG.info("[IQ DEADLINE] %s.%s: %s esperas limitadas", cls.__name__, method, count[0])
+        except Exception as exc:
+            LOG.error("[IQ DEADLINE] indisponível em %s.%s: %s", cls.__name__, method, type(exc).__name__)
+
+install_iq_internal_deadlines()
 
 def abort_iq_client(client):
     """Encerra HTTP/socket usando os métodos disponíveis na biblioteca instalada."""
@@ -256,6 +320,7 @@ def login_blocking(email, password, cancelled, started, attempt):
         iq_login_stage("connect_authentication_websocket")
         # A biblioteca executa autenticação e abertura de WebSocket dentro de connect().
         # Sem instrumentar a biblioteca não é possível distinguir essas subetapas.
+        IQ_CONNECT_CONTEXT.attempt = {"deadline": started + LOGIN_TIMEOUT - 5, "cancelled": cancelled, "stage": None}
         connect_result = iq.connect()
         if isinstance(connect_result, (tuple, list)):
             ok = bool(connect_result[0]) if connect_result else False
@@ -285,6 +350,7 @@ def login_blocking(email, password, cancelled, started, attempt):
         accepted = True
         return iq
     finally:
+        IQ_CONNECT_CONTEXT.attempt = None
         if not accepted:
             abort_iq_client(iq)
 
