@@ -145,6 +145,135 @@ def iq_network_test():
 MIN_CANDLES = 75
 PAIRS = {"EUR/USD":"EURUSD", "GBP/USD":"GBPUSD", "USD/JPY":"USDJPY", "EUR/JPY":"EURJPY", "GBP/JPY":"GBPJPY", "AUD/USD":"AUDUSD", "USD/CAD":"USDCAD"}
 
+CURRENCIES = set("EUR USD GBP JPY AUD CAD CHF NZD BRL MXN ZAR TRY NOK SEK DKK SGD HKD PLN RUB INR CNY CNH AED THB KRW IDR".split())
+CRYPTO_BASES = set("BTC ETH LTC XRP BCH BNB ADA SOL DOGE DOT TRX EOS ETC LINK MATIC AVAX TON ATOM DASH XLM UNI APT NEAR FIL SHIB ICP USDT PEPE SUI ARB OP".split())
+
+def describe_iq_asset(code, kind=None):
+    code = str(code)
+    otc = "OTC" in code.upper()
+    core = re.sub(r"(?:-OTC|-op|-L)$", "", code, flags=re.I).upper()
+    compact = core.replace("/", "").replace("-", "")
+    forex = len(compact) == 6 and compact[:3] in CURRENCIES and compact[3:] in CURRENCIES
+    crypto = kind == "crypto" or any(compact == base + quote for base in CRYPTO_BASES for quote in ("USD", "EUR", "USDT", "BTC")) or any(word in core for word in ("BITCOIN", "ETHEREUM", "DOGECOIN", "LITECOIN", "CARDANO", "SOLANA", "RIPPLE", "POLKADOT", "CHAINLINK", "TRON"))
+    if kind == "forex": forex = True
+    if forex:
+        label = compact[:3] + "/" + compact[3:]
+        group = "FOREX_OTC" if otc else "FOREX_OPEN"
+    elif crypto:
+        label = core
+        for quote in ("USDT", "USD", "EUR", "BTC"):
+            if core.endswith(quote) and len(core) > len(quote):
+                label = core[:-len(quote)] + "/" + quote
+                break
+        group = "CRYPTO_OTC" if otc else "CRYPTO_OPEN"
+    elif otc:
+        label, group = core, "OTHER_OTC"
+    else:
+        return None
+    if otc: label += " OTC"
+    if code.lower().endswith("-op"): label += " (opções)"
+    if code.endswith("-L"): label += " (cripto)"
+    return {"symbol": code, "code": code, "label": label, "group": group,
+            "market": "IQ_OTC" if otc else "OPEN", "open": None}
+
+def initial_iq_catalog(s):
+    records = {}
+    for code, active_id in s["iq"].get_all_ACTIVES_OPCODE().items():
+        item = describe_iq_asset(code)
+        if item and isinstance(active_id, int) and active_id > 0:
+            records[code] = {**item, "active_id": active_id}
+    return records
+
+def refresh_iq_catalog(s):
+    """Consultas serializadas e limitadas, sem reconectar nem alterar autenticação."""
+    records = initial_iq_catalog(s)
+    errors = []
+    iq = s["iq"]
+    api = iq.api
+    def await_field(name, seconds=6):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            value = getattr(api, name, None)
+            if value is not None: return value
+            if not iq.check_connect(): raise RuntimeError("IQ desconectada")
+            time.sleep(.05)
+        raise TimeoutError("Consulta de ativos expirou")
+    def add(code, active_id, kind=None, opened=None):
+        item = describe_iq_asset(code, kind)
+        try: active_id = int(active_id)
+        except (ValueError, TypeError): return
+        if not item or active_id <= 0: return
+        previous = records.get(code)
+        if previous and previous.get("open") is True: opened = True
+        records[code] = {**item, "active_id": active_id, "open": opened}
+    with s.setdefault("data_lock", threading.RLock()):
+        if not iq.check_connect(): raise RuntimeError("Conecte à IQ primeiro")
+        try:
+            api.api_option_init_all_result_v2 = None
+            api.get_api_option_init_all_v2()
+            data = await_field("api_option_init_all_result_v2")
+            data = data.get("result", data)
+            for family in ("binary", "turbo"):
+                for active_id, detail in data.get(family, {}).get("actives", {}).items():
+                    code = str(detail.get("name", "")).split(".")[-1]
+                    add(code, active_id, opened=bool(detail.get("enabled") and not detail.get("is_suspended", False)))
+        except Exception as exc: errors.append("options:" + type(exc).__name__)
+        for kind in ("forex", "crypto"):
+            try:
+                api.instruments = None
+                api.get_instruments(kind)
+                data = await_field("instruments")
+                for detail in data.get("instruments", []):
+                    opened = any(float(t.get("open", 0)) <= time.time() < float(t.get("close", 0)) for t in detail.get("schedule", [])) if "schedule" in detail else None
+                    add(str(detail["id"]), detail["active_id"], kind, opened)
+            except Exception as exc: errors.append(kind + ":" + type(exc).__name__)
+        try:
+            api.underlying_list_data = None
+            api.get_digital_underlying()
+            data = await_field("underlying_list_data")
+            for detail in data.get("underlying", []):
+                code = str(detail.get("underlying", ""))
+                active_id = detail.get("active_id", records.get(code, {}).get("active_id"))
+                opened = any(float(t.get("open", 0)) <= time.time() < float(t.get("close", 0)) for t in detail.get("schedule", [])) if "schedule" in detail else None
+                add(code, active_id, opened=opened)
+        except Exception as exc: errors.append("digital:" + type(exc).__name__)
+        from iqoptionapi import constants
+        with LOCK:
+            for code, detail in records.items():
+                constants.ACTIVES[code] = detail["active_id"]
+            s["asset_catalog"] = records
+            s["asset_catalog_time"] = time.time()
+            s["asset_catalog_errors"] = errors
+    return records
+
+@app.get('/iq-assets')
+def iq_assets(request: Request, refresh: bool=False):
+    s = session(request)
+    with LOCK:
+        if "asset_catalog" not in s:
+            s["asset_catalog"] = initial_iq_catalog(s)
+        future = s.get("asset_catalog_future")
+        if future and future.done():
+            try: future.result()
+            except Exception as exc: s["asset_catalog_errors"] = [type(exc).__name__]
+        age = time.time() - s.get("asset_catalog_attempt", 0)
+        if (future is None or future.done()) and age >= (30 if refresh else 300):
+            s["asset_catalog_attempt"] = time.time()
+            future = POOL.submit(refresh_iq_catalog, s)
+            s["asset_catalog_future"] = future
+        rows = [dict(x) for x in s["asset_catalog"].values()]
+    return {"source": "IQ_OPTION", "assets": sorted(rows, key=lambda x:(x["group"], x["label"], x["code"])),
+            "loading": bool(future and not future.done()), "updated_at": s.get("asset_catalog_time"),
+            "errors": s.get("asset_catalog_errors", []), "count": len(rows)}
+
+def resolve_iq_asset(s, symbol):
+    catalog = s.get("asset_catalog") or initial_iq_catalog(s)
+    code = PAIRS.get(symbol, symbol)
+    item = catalog.get(code)
+    if not item: raise ValueError("Ativo não informado pela IQ. Atualize a lista de ativos.")
+    if item.get("open") is False: raise ValueError("Ativo fechado na IQ Option")
+    return item
+
 class Login(BaseModel):
     email: str
     password: str
@@ -476,9 +605,10 @@ def iq_status(request:Request):
 def fetch_candles(s,symbol,count=180):
     iq=s['iq']
     if not iq.check_connect():raise RuntimeError("WebSocket IQ desconectado. Faça novo login.")
-    code=PAIRS.get(symbol)
-    if not code:raise ValueError("Par não permitido")
-    raw=iq.get_candles(code,60,count,int(time.time()))
+    asset=resolve_iq_asset(s,symbol)
+    code=asset["code"]
+    with s.setdefault("data_lock", threading.RLock()):
+        raw=iq.get_candles(code,60,count,int(time.time()))
     if not raw or len(raw)<MIN_CANDLES:raise RuntimeError("IQ retornou poucos candles M1")
     rows=[]
     for c in raw:
@@ -633,7 +763,7 @@ def signal(request:Request,symbol:str='EUR/USD',interval:str='1min'):
         rows=call_timeout(fetch_candles,s,symbol,200,seconds=14)
         with LOCK:
             settle(s,rows,symbol)
-            result=scalping_m1_flex_strategy(rows,symbol=symbol,timeframe='1min',market='OPEN')
+            result=scalping_m1_flex_strategy(rows,symbol=symbol,timeframe='1min',market='IQ_OTC' if 'OTC' in symbol.upper() else 'OPEN')
             result=maybe_register(s,symbol,result,rows)
         return {'ok':True,'source':'IQ_OPTION','symbol':symbol,'candle_timestamp':rows[-1]['timestamp'],**result}
     except Exception as exc:
@@ -661,7 +791,7 @@ def health():return {'ok':True,'version':'2.0.0','iq_library':IQ_Option is not N
 
 @app.get('/',response_class=HTMLResponse)
 def index():
-    with open(os.path.join(os.path.dirname(__file__),'index.html'),encoding='utf8') as f:return HTMLResponse(f.read())
+    return HTMLResponse(APP_HTML)
 
 @app.get('/iq-files-check')
 def iq_files_check():
@@ -712,3 +842,5 @@ def iq_files_check():
         result["inspection_error_type"] = type(exc).__name__
     result["note"] = "Certificado ausente é uma pista; este teste não comprova a causa do timeout de rede."
     return result
+
+APP_HTML = '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Mega IA Trader • Parceiro</title><style>\n:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#021123;color:#e8f4ff;font:14px system-ui,Arial}header{background:#03152a;padding:20px 14px;border-bottom:1px solid #164e79}h1{margin:0;font-size:27px}small,.sub{color:#8faac3;font-size:11px}main{max-width:850px;margin:auto;padding:12px}.panel{background:linear-gradient(145deg,#071c33,#031326);border:1px solid #174468;border-radius:15px;padding:15px;margin:10px 0}.row{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}.controls{display:flex;gap:8px;flex-wrap:wrap}button,select,input{background:#0b2541;border:1px solid #255178;color:#eef8ff;padding:11px;border-radius:10px;font:inherit}button{cursor:pointer}.green{background:#086a47;border-color:#0bd68d}.tabs button{font-weight:650}.tabs button.active{border-color:#23c4ff;box-shadow:0 0 10px #136b91}.hidden{display:none!important}.title{font-size:19px;font-weight:800;color:#f5c35e}.hero{text-align:center;padding:20px;border:1px solid #ad8739;border-radius:15px;background:linear-gradient(135deg,#071b32,#0b1c2b)}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.card{border:1px solid #178b8d;background:#061e2d;border-radius:15px;padding:17px 9px;text-align:center;min-height:145px}.card:nth-child(2){border-color:#277cd2}.card:nth-child(3){border-color:#8643bd}.big{font-size:29px;font-weight:900;margin:15px 0;color:#f9d46b}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.stat{background:#08233d;padding:16px;text-align:center;border:1px solid #215079;border-radius:12px}.stat b{font-size:28px;color:#3de3b3}.warn{color:#ffba77}.bad{color:#ff7070}.good{color:#42e6ac}.muted{color:#9ab0c3}input{width:100%;margin:5px 0 12px;background:#dfefff;color:#182c3b}.full{width:100%}.entry{border-bottom:1px solid #29445b;padding:12px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere}#msg{margin-top:10px} @media(max-width:500px){.cards{gap:6px}.card{padding:12px 5px}.big{font-size:23px}.tabs button{padding:9px}}\n</style></head><body><header><h1>🌌 MEGA IA 🇧🇷</h1><div class="sub">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div><div id="clock"></div></header><main>\n<section class="panel"><div class="row"><div><b>⚡ CONTROLE PRINCIPAL</b><div class="sub">App parceiro • somente Mega Bot</div></div><button id="onoff" class="green" onclick="toggleApp()">🟢 APP LIGADO</button></div></section>\n<section class="panel"><div class="controls"><select id="symbol" aria-label="Ativo IQ Option"><option>EUR/USD</option><option>GBP/USD</option><option>EUR/JPY</option><option>USD/JPY</option><option>GBP/JPY</option><option>AUD/USD</option><option>USD/CAD</option></select><select disabled><option>1min</option></select><select id="assetGroup" onchange="renderAssets()"><option value="ALL">Todos os mercados</option><option value="FOREX_OPEN">Forex aberto</option><option value="FOREX_OTC">Forex OTC</option><option value="CRYPTO_OPEN">Cripto aberto</option><option value="CRYPTO_OTC">Cripto OTC</option><option value="OTHER_OTC">Outros OTC</option></select><button onclick="loadAssets(true)">↻ Atualizar ativos IQ</button><button>🟢 Mega Bot • AUTOMÁTICO</button></div><div class="sub" style="margin-top:9px">Mercado aberto e OTC • candles IQ Option • entrada na próxima vela • pré-alerta 20s</div></section>\n<div class="sub" id="assetStatus" role="status">Conecte à IQ para carregar os ativos.</div><p style="text-align:center;font-weight:700">App criado e desenvolvido por Ismael Trader</p>\n<div class="controls tabs"><button class="active" onclick="tab(\'painel\',this)">📊 Painel</button><button onclick="tab(\'resultados\',this)">🎯 Resultados</button><button onclick="tab(\'historico\',this)">🗓 Histórico 15 dias</button><button onclick="tab(\'gestao\',this)">⚙️ Gestão</button><button onclick="tab(\'corretora\',this)">🏦 Corretora</button></div>\n<section id="painel"><div class="hero"><div class="title">🏆 MEGA BOT</div><p>ANÁLISE EM TEMPO REAL • ENTRADA NA PRÓXIMA VELA</p><div class="sub">SCALPING M1 FLEX • M15 / M5 / M1</div></div><div class="cards" style="margin-top:10px"><div class="card"><b>🤖 DIREÇÃO DO SINAL</b><div class="big" id="direction">NEUTRO</div><small id="confidence">Confiança: 0%</small></div><div class="card"><b>◷ CRONOGRAMA</b><div class="big" id="timer">--:--</div><small>Entrada: próxima M1</small></div><div class="card"><b>⚡ STATUS DO MOTOR</b><div class="big" id="engine">AGUARDANDO</div><small id="source">Fonte: nenhuma</small></div></div><div class="panel"><b>📡 FONTE DE DADOS</b><p id="reason" class="warn">Conecte a IQ Option na aba Corretora.</p></div><div class="panel"><b>🔭 Radar de oportunidades</b><p id="radar">⚪ EUR/USD • aguardando dados IQ</p><div class="sub">Pré-alerta informativo; não executa ordens na corretora.</div></div></section>\n<section id="resultados" class="hidden"><div class="panel"><h3>📊 RESUMO GERAL</h3><div class="stats"><div class="stat">WIN<br><b id="wins">0</b></div><div class="stat">LOSS FINAL<br><b id="losses">0</b></div><div class="stat">ACERTO<br><b id="accuracy">0%</b></div></div><p class="sub">Resultados virtuais pelas velas IQ. Não são operações executadas.</p></div><div class="panel"><h3>⏳ Sequência em andamento</h3><pre id="active">Nenhuma</pre></div></section>\n<section id="historico" class="hidden"><div class="panel"><h3>🗓 Histórico de resultados</h3><div id="history">Sem operações encerradas.</div><p class="sub">Histórico mantido na memória da sessão; reinício do servidor apaga os dados deste protótipo.</p></div></section>\n<section id="gestao" class="hidden"><div class="panel"><h3>⚙️ Gestão</h3><p><b>Recuperação no próximo sinal</b></p><p>LOSS inicial → aguardar próximo sinal confirmado (REC 1) → se perder, aguardar outro sinal (REC 2) → somente então LOSS FINAL.</p><p class="sub">Gale automático na vela seguinte não está ativado nesta primeira versão.</p></div></section>\n<section id="corretora" class="hidden"><div class="panel"><h3>🏦 Corretora</h3><select disabled class="full"><option>IQ Option • fonte exclusiva de dados</option></select><p id="iqstate" class="warn">🔴 IQ Option desconectada</p><label>E-mail da corretora<input id="email" type="email" autocomplete="username" placeholder="Seu e-mail IQ"></label><label>Senha<input id="password" type="password" autocomplete="current-password" placeholder="Sua senha IQ"></label><button class="full green" onclick="login()">🔐 CONECTAR IQ OPTION</button><button class="full" style="margin-top:10px" onclick="logout()">DESCONECTAR</button><div id="msg" class="warn"></div><p class="sub">A senha é enviada ao servidor somente no login; não é salva no navegador. Este app não executa ordens.</p></div><div class="panel"><b>🔬 Teste de candles IQ</b><p>Verifica 75+ velas M1 fechadas, atualizadas e sem lacunas recentes.</p><button onclick="testCandles()">TESTAR CANDLES M1</button><pre id="testout"></pre></div></section>\n</main><script>\nlet enabled=true;let busy=false;const $=id=>document.getElementById(id);function tab(id,btn){[\'painel\',\'resultados\',\'historico\',\'gestao\',\'corretora\'].forEach(x=>$(x).classList.toggle(\'hidden\',x!==id));document.querySelectorAll(\'.tabs button\').forEach(x=>x.classList.remove(\'active\'));btn.classList.add(\'active\')}\nfunction toggleApp(){enabled=!enabled;$(\'onoff\').textContent=enabled?\'🟢 APP LIGADO\':\'🔴 APP DESLIGADO\';$(\'onoff\').classList.toggle(\'green\',enabled)}\nasync function api(path,opts={}){let r=await fetch(path,{credentials:\'same-origin\',...opts});let j=await r.json();if(!r.ok)throw Error(j.detail||\'Falha de comunicação\');return j}\nlet iqAssets=[],assetsLoading=false,lastAssets=0;\nconst groupNames={FOREX_OPEN:\'Forex • aberto\',FOREX_OTC:\'Forex • OTC\',CRYPTO_OPEN:\'Cripto • aberto\',CRYPTO_OTC:\'Cripto • OTC\',OTHER_OTC:\'Outros • OTC\'};\nfunction renderAssets(){let old=$(\'symbol\').value;let filter=$(\'assetGroup\').value;let list=iqAssets.filter(x=>filter===\'ALL\'||x.group===filter);if(!iqAssets.length)return;$(\'symbol\').replaceChildren();for(let [group,title] of Object.entries(groupNames)){let subset=list.filter(x=>x.group===group);if(!subset.length)continue;let optgroup=document.createElement(\'optgroup\');optgroup.label=title;for(let a of subset){let option=document.createElement(\'option\');option.value=a.symbol;option.textContent=a.label+(a.open===false?\' • fechado\':\'\');optgroup.appendChild(option)}$(\'symbol\').appendChild(optgroup)}if(list.some(a=>a.symbol===old))$(\'symbol\').value=old;if(!list.length){let o=document.createElement(\'option\');o.value=\'\';o.textContent=\'Nenhum ativo IQ nesta categoria\';$(\'symbol\').appendChild(o)}$(\'direction\').textContent=\'NEUTRO\';$(\'confidence\').textContent=\'Confiança: 0%\'}\nasync function loadAssets(force=false){if(assetsLoading)return;assetsLoading=true;try{let d=await api(\'/iq-assets\'+(force?\'?refresh=true\':\'\'));iqAssets=d.assets||[];renderAssets();$(\'assetStatus\').textContent=d.count+\' ativos IQ • \'+(d.loading?\'atualizando lista...\':d.errors.length?\'lista parcial; algumas consultas não responderam\':\'lista atualizada\')+\' • velas verificadas por ativo\';lastAssets=Date.now();if(d.loading)setTimeout(()=>loadAssets(),3000)}catch(e){$(\'assetStatus\').textContent=e.message}finally{assetsLoading=false}}\n\nasync function login(){let e=$(\'email\').value,p=$(\'password\').value;$(\'msg\').textContent=\'Conectando à IQ Option...\';try{let r=await api(\'/iq-login\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({email:e,password:p})});$(\'password\').value=\'\';$(\'msg\').textContent=r.message;await status();await loadAssets(true)}catch(err){$(\'password\').value=\'\';$(\'msg\').textContent=err.message}}\nasync function logout(){try{await api(\'/iq-logout\',{method:\'POST\'});await status()}catch(e){$(\'msg\').textContent=e.message}}\nasync function status(){try{let d=await api(\'/iq-status\');$(\'iqstate\').textContent=d.connected?\'🟢 IQ Option conectada\':\'🔴 IQ Option desconectada\';return d.connected}catch(e){return false}}\nasync function testCandles(){$(\'testout\').textContent=\'Consultando IQ...\';try{if(!$(\'symbol\').value)throw Error(\'Selecione um ativo IQ\');let d=await api(\'/candles?symbol=\'+encodeURIComponent($(\'symbol\').value)+\'&limit=5\');$(\'testout\').textContent=JSON.stringify(d,null,2)}catch(e){$(\'testout\').textContent=e.message}}\nasync function poll(){if(!enabled||busy)return;busy=true;try{let connected=await status();if(!connected){$(\'engine\').textContent=\'OFFLINE\';$(\'reason\').textContent=\'AGUARDANDO DADOS • IQ Option desconectada\';$(\'direction\').textContent=\'NEUTRO\';return}if(Date.now()-lastAssets>300000)loadAssets();let symbol=$(\'symbol\').value;if(!symbol){$(\'reason\').textContent=\'Nenhum ativo nesta categoria\';return}let d=await api(\'/signal-ai?symbol=\'+encodeURIComponent(symbol));$(\'direction\').textContent=d.direction||\'NEUTRO\';$(\'confidence\').textContent=\'Confiança: \'+(d.confidence||0)+\'%\';$(\'engine\').textContent=d.ok?\'ONLINE\':\'AGUARDANDO\';$(\'source\').textContent=\'Fonte: \'+(d.source||\'NONE\');$(\'reason\').textContent=d.reason||\'\';$(\'radar\').textContent=symbol+\' • \'+(d.direction||\'NEUTRO\')+\' • \'+(d.reason||\'\');let p=await api(\'/performance\');$(\'wins\').textContent=p.wins;$(\'losses\').textContent=p.losses;$(\'accuracy\').textContent=p.accuracy+\'%\';$(\'active\').textContent=JSON.stringify(p.active,null,2);$(\'history\').innerHTML=p.history.length?p.history.slice().reverse().map(x=>\'<div class="entry">\'+new Date(x.finished_at*1000).toLocaleString(\'pt-BR\')+\' • \'+x.symbol+\' • <b>\'+x.final+\'</b><div class="sub">\'+x.steps.map(y=>[\'INICIAL\',\'REC 1\',\'REC 2\'][y.stage]+\': \'+y.result).join(\' → \')+\'</div></div>\').join(\'\'):\'Sem operações encerradas.\'}catch(e){$(\'reason\').textContent=e.message}finally{busy=false}}\nfunction tick(){let n=new Date();$(\'clock\').textContent=new Intl.DateTimeFormat(\'pt-BR\',{timeZone:\'America/Sao_Paulo\',hour:\'2-digit\',minute:\'2-digit\',second:\'2-digit\'}).format(n)+\' • Brasília\';$(\'timer\').textContent=String(60-n.getUTCSeconds()).padStart(2,\'0\')+\'s\'}setInterval(tick,1000);tick();setInterval(poll,8000);poll();status().then(connected=>{if(connected)loadAssets()});\n</script></body></html>\n'
