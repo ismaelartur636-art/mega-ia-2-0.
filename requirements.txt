@@ -1,7 +1,7 @@
 fastapi
 uvicorn[standard]
 httpx
-websocket-client
+websocket-client==0.56.0
 numpy
 xgboost
 pydantic
