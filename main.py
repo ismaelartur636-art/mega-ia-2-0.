@@ -14,6 +14,39 @@ except ImportError:
 
 app = FastAPI(title="MEGA IA Parceiro", version="2.0.0")
 LOG = logging.getLogger("mega_parceiro")
+def prepare_iq_certificate():
+    """Disponibiliza o CA bundle esperado pela biblioteca sem substituir arquivo existente."""
+    from pathlib import Path
+    target = Path.cwd() / "cacert.pem"
+    try:
+        if target.exists():
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.load_verify_locations(cafile=str(target))
+            return {"ready": True, "source": "existing", "created": False}
+        import certifi
+        source = Path(certifi.where())
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.load_verify_locations(cafile=str(source))
+        import tempfile
+        with tempfile.NamedTemporaryFile(dir=target.parent, prefix="iq-ca-", delete=False) as temp:
+            temporary = Path(temp.name)
+            temp.write(source.read_bytes())
+        try:
+            os.chmod(temporary, 0o644)
+            os.link(temporary, target)
+        except FileExistsError:
+            pass
+        finally:
+            temporary.unlink(missing_ok=True)
+        context.load_verify_locations(cafile=str(target))
+        LOG.warning("[IQ CERT] cacert.pem disponível e validado")
+        return {"ready": True, "source": "certifi", "created": True}
+    except Exception as exc:
+        LOG.error("[IQ CERT] preparo falhou: %s", type(exc).__name__)
+        return {"ready": False, "error_type": type(exc).__name__}
+
+IQ_CERTIFICATE_SETUP = prepare_iq_certificate()
+
 BR = ZoneInfo("America/Sao_Paulo")
 SESSIONS = {}
 LOCK = threading.RLock()
@@ -636,7 +669,7 @@ def iq_files_check():
     import importlib.metadata
     import inspect
     from pathlib import Path
-    result = {"diagnostic_version": "files-1", "iq_library_loaded": IQ_Option is not None}
+    result = {"diagnostic_version": "files-2", "certificate_setup": IQ_CERTIFICATE_SETUP, "iq_library_loaded": IQ_Option is not None}
     versions = {}
     for name in ("websocket-client", "requests", "certifi", "iqoptionapi"):
         try:
