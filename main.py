@@ -1,4 +1,5 @@
 import os
+import html
 import asyncio
 import time
 import json
@@ -35057,7 +35058,20 @@ async def _client_remote_status(key: str, device: str = "", claim: bool = False)
     return {k:v for k,v in data.items() if k!="_ts"}
 
 LICENSE_PAGE=r"""<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEGA IA • Licença</title><style>
-body{margin:0;background:#030812;color:#eef5ff;font-family:Arial;display:grid;place-items:center;min-height:100vh}.box{width:min(92vw,430px);background:#0b192a;border:1px solid #168cff;border-radius:22px;padding:24px;box-shadow:0 0 30px #168cff33}h1{margin:0 0 8px;color:#31c8ff}p{color:#9fb2ca;line-height:1.45}input,button{box-sizing:border-box;width:100%;padding:14px;border-radius:13px;border:1px solid #22689d;background:#0d2035;color:white;font-size:16px;margin-top:10px}button{background:#0d7d49;border-color:#35e889;font-weight:900}.err{color:#ff6673;margin-top:12px}</style></head><body><div class="box"><h1>🤖 MEGA IA</h1><h3>Liberação do Professor</h3><p>Digite a chave fornecida pelo Professor para liberar este aplicativo.</p><form method="post" action="/license/activate"><input name="key" placeholder="MEGA-XXXXXX-XXXXXX" autocomplete="off" required><button>LIBERAR APP</button></form>__ERROR__</div></body></html>"""
+body{margin:0;background:#030812;color:#eef5ff;font-family:Arial;display:grid;place-items:center;min-height:100vh}.box{width:min(92vw,430px);background:#0b192a;border:1px solid #168cff;border-radius:22px;padding:24px;box-shadow:0 0 30px #168cff33}h1{margin:0 0 8px;color:#31c8ff}p{color:#9fb2ca;line-height:1.45}input,button{box-sizing:border-box;width:100%;padding:14px;border-radius:13px;border:1px solid #22689d;background:#0d2035;color:white;font-size:16px;margin-top:10px}button{background:#0d7d49;border-color:#35e889;font-weight:900}.err{color:#ff6673;margin-top:12px}</style></head><body><div class="box"><h1>🤖 MEGA IA</h1><h3>Liberação do Professor</h3><p>Digite a chave fornecida pelo Professor para liberar este aplicativo.</p><form id="licenseForm" method="post" action="/license/activate"><input name="key" placeholder="MEGA-XXXXXX-XXXXXX" autocomplete="off" required><input type="hidden" name="device" value="__DEVICE__"><button>LIBERAR APP</button></form>__ERROR__</div></body></html>"""
+
+def _license_page_response(request: Request, error: str = "", status_code: int = 200):
+    # Gera o identificador no servidor; a ativação não depende de JavaScript/localStorage.
+    device=str(request.cookies.get(LICENSE_DEVICE_COOKIE, "") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", device):
+        device=secrets.token_hex(32)
+    safe_error=html.escape(error or "")
+    page=LICENSE_PAGE.replace("__DEVICE__", device).replace("__ERROR__", f'<div class="err">{safe_error}</div>' if safe_error else "")
+    response=HTMLResponse(page, status_code=status_code)
+    forwarded_proto=str(request.headers.get("x-forwarded-proto", "")).split(",")[0].strip().lower()
+    secure_cookie=(request.url.scheme=="https" or forwarded_proto=="https")
+    response.set_cookie(LICENSE_DEVICE_COOKIE, device, max_age=60*60*24*370, httponly=True, samesite="lax", secure=secure_cookie, path="/")
+    return response
 
 @app.post("/license/activate")
 async def license_activate(request: Request):
@@ -35067,14 +35081,20 @@ async def license_activate(request: Request):
         raise HTTPException(413, "Formulário muito grande.")
     form = urllib.parse.parse_qs(raw_body.decode("utf-8", errors="replace"), keep_blank_values=True)
     key=str((form.get("key") or [""])[0]).strip().upper()
-    device=request.cookies.get(LICENSE_DEVICE_COOKIE, "")
+    # Use a stable browser ID from localStorage when cookies are missing/blocked,
+    # falling back to the existing HttpOnly cookie for older clients.
+    posted_device=str((form.get("device") or [""])[0]).strip().lower()
+    cookie_device=str(request.cookies.get(LICENSE_DEVICE_COOKIE, "") or "").strip().lower()
+    device=posted_device if re.fullmatch(r"[0-9a-f]{64}",posted_device) else cookie_device
     if not re.fullmatch(r"[0-9a-f]{64}",device): device=secrets.token_hex(32)
     st=await _client_remote_status(key,device,True)
     if not st.get("valid"):
-        return HTMLResponse(LICENSE_PAGE.replace("__ERROR__",f'<div class="err">{st.get("reason","Licença inválida.")}</div>'),status_code=403)
+        return _license_page_response(request, str(st.get("reason", "Licença inválida.")), 403)
     resp=RedirectResponse("/",status_code=303)
-    resp.set_cookie(LICENSE_COOKIE,key,max_age=60*60*24*370,httponly=True,samesite="lax",secure=request.url.scheme=="https")
-    resp.set_cookie(LICENSE_DEVICE_COOKIE,device,max_age=60*60*24*370,httponly=True,samesite="lax",secure=request.url.scheme=="https")
+    forwarded_proto=str(request.headers.get("x-forwarded-proto", "")).split(",")[0].strip().lower()
+    secure_cookie=(request.url.scheme=="https" or forwarded_proto=="https")
+    resp.set_cookie(LICENSE_COOKIE,key,max_age=60*60*24*370,httponly=True,samesite="lax",secure=secure_cookie,path="/")
+    resp.set_cookie(LICENSE_DEVICE_COOKIE,device,max_age=60*60*24*370,httponly=True,samesite="lax",secure=secure_cookie,path="/")
     return resp
 
 @app.get("/license/status")
@@ -35095,7 +35115,7 @@ async def mega_license_guard(request: Request, call_next):
     st=await _client_remote_status(key,request.cookies.get(LICENSE_DEVICE_COOKIE,""))
     if not st.get("valid"):
         if request.method in ("GET","HEAD") and path=="/":
-            return HTMLResponse(LICENSE_PAGE.replace("__ERROR__",f'<div class="err">{st.get("reason","")}</div>'),status_code=200)
+            return _license_page_response(request, str(st.get("reason", "")), 200)
         return JSONResponse({"detail":"APP BLOQUEADO","license":st},status_code=403)
     return await call_next(request)
 
