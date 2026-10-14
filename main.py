@@ -391,7 +391,16 @@ def scalping_m1_claim(result, symbol, market):
 PWA_VERSION = "v229"
 
 # ===== MEGA IA PROFESSOR / CLIENTE =====
-APP_ROLE = os.getenv("MEGA_APP_ROLE", os.getenv("APP_ROLE", "PROFESSOR")).strip().upper()
+# Papel automático: evita que o serviço Parceiro consulte o banco local vazio
+# quando MEGA_APP_ROLE não foi configurado no Render.
+_role_env = (os.getenv("MEGA_APP_ROLE") or os.getenv("APP_ROLE") or "").strip().upper()
+_render_service = (os.getenv("RENDER_SERVICE_NAME") or "").strip().lower()
+if _role_env in ("PROFESSOR", "PARTNER", "PARCEIRO", "CLIENT", "CLIENTE"):
+    APP_ROLE = "PROFESSOR" if _role_env == "PROFESSOR" else "PARTNER"
+elif _render_service:
+    APP_ROLE = "PROFESSOR" if ("professor" in _render_service or "master" in _render_service) else "PARTNER"
+else:
+    APP_ROLE = "PROFESSOR"
 CLIENT_HIDE_ENGINES = os.getenv("MEGA_CLIENT_HIDE_ENGINES", "1").strip().lower() not in ("0", "false", "off", "no")
 MASTER_SERVER_URL = os.getenv("MEGA_MASTER_SERVER_URL", "https://mega-ia-professor.onrender.com").strip().rstrip("/")
 PARTNER_APP_URL = os.getenv("MEGA_PARTNER_APP_URL", "https://mega-ia-2-0.onrender.com").strip().rstrip("/")
@@ -35049,7 +35058,16 @@ async def _client_remote_status(key: str, device: str = "", claim: bool = False)
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
             r=(await client.post(MASTER_SERVER_URL+"/license/claim",json={"key":key,"device":device})) if claim else (await client.get(MASTER_SERVER_URL+"/license/validate",params={"key":key,"device":device}))
-            data=r.json() if r.status_code==200 else {"valid":False,"reason":f"Professor recusou a validação (HTTP {r.status_code})."}
+            if r.status_code == 200:
+                data = r.json()
+            else:
+                detail = ""
+                try:
+                    payload = r.json()
+                    detail = str(payload.get("detail") or payload.get("reason") or "") if isinstance(payload, dict) else ""
+                except Exception:
+                    detail = (r.text or "")[:160]
+                data = {"valid": False, "reason": f"Professor recusou a validação (HTTP {r.status_code})" + (f": {detail}" if detail else ".")}
     except Exception as exc:
         print(f"[LICENCA] Falha de comunicação com Professor: {type(exc).__name__}", flush=True)
         return {"valid":False,"reason":"Não foi possível validar com o Professor."}
@@ -35793,7 +35811,6 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
           <div class="mega-command-label">↗ DIREÇÃO DO SINAL</div>
           <div id="direction" class="big neutral">AGUARDANDO</div>
           <div id="signalAsset" class="signal-asset"></div>
-          <div id="signalEntryMeta" style="display:block;margin:6px 8px 10px;padding:10px 12px;border:1px solid rgba(52,255,164,.28);border-radius:10px;background:rgba(2,20,13,.72);font-size:13px;font-weight:900;line-height:1.6;color:#d9ffe9;text-align:center;overflow-wrap:anywhere">PARIDADE: --<br>HORÁRIO DE ENTRADA: --:--:--</div>
           <div class="mega-command-meter"><div class="mega-command-meter-fill" id="megaGoldConfidenceBar"></div></div>
           <div id="confidence">Confiança: --</div>
         </div>
@@ -37671,7 +37688,6 @@ let brokerConnected={IQ_OPTION:false};
 const chartInfo=document.getElementById('chartInfo');
 const direction=document.getElementById('direction');
 const signalAsset=document.getElementById('signalAsset');
-const signalEntryMeta=document.getElementById('signalEntryMeta');
 const signalCard=document.getElementById('signalCard');
 const moneyFx=document.getElementById('moneyFx');
 const confidence=document.getElementById('confidence');
@@ -44457,25 +44473,18 @@ async function sig(announce=false){
       analysisText.style.display='block';
     }
 
-    const displayDirection=String(cur.direction||'NEUTRO').toUpperCase();
-    direction.textContent=displayDirection==='CALL'?'⬆ CALL · COMPRA':(displayDirection==='PUT'?'⬇ PUT · VENDA':'AGUARDANDO SINAL');
+    direction.textContent=cur.direction||'NEUTRO';
     direction.className='big '+(
-      displayDirection==='CALL'?'call':
-      displayDirection==='PUT'?'put':
+      cur.direction==='CALL'?'call':
+      cur.direction==='PUT'?'put':
       'neutral'
     );
-    const displayedSymbol=String(cur.symbol||((S&&S.value)||'--')).trim();
-    paintSignalAsset(displayedSymbol);
-    if(signalEntryMeta){
-      const entryLabel=(displayDirection==='CALL'||displayDirection==='PUT') && cur.entry_time ? ft(cur.entry_time) : 'AGUARDANDO SINAL';
-      signalEntryMeta.innerHTML='💱 PARIDADE: '+displayedSymbol.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')+'<br>🕒 HORÁRIO DE ENTRADA: '+entryLabel;
-      signalEntryMeta.style.borderColor=displayDirection==='PUT'?'rgba(255,85,114,.48)':'rgba(52,255,164,.28)';
-    }
+    paintSignalAsset(cur.symbol||((S&&S.value)||''));
 
-    confidence.textContent='Confiança: '+(displayDirection==='NEUTRO'?0:Number(cur.confidence||0)).toFixed(0)+'%';
+    confidence.textContent='Confiança: '+(String(cur.direction||'NEUTRO').toUpperCase()==='NEUTRO'?0:Number(cur.confidence||0)).toFixed(0)+'%';
 
     entry.textContent=
-      displayDirection==='NEUTRO'||!cur.entry_time
+      cur.direction==='NEUTRO'||!cur.entry_time
       ? 'AGUARDANDO SINAL'
       : ft(cur.entry_time);
 
@@ -44584,7 +44593,6 @@ async function sig(announce=false){
       direction.textContent='NEUTRO';
       direction.className='big neutral';
       entry.textContent='AGUARDANDO DADOS';
-      if(signalEntryMeta) signalEntryMeta.innerHTML='💱 PARIDADE: '+String((S&&S.value)||'--').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')+'<br>🕒 HORÁRIO DE ENTRADA: AGUARDANDO SINAL';
       countdown.textContent='Sem entrada confirmada';
       if(dataFeedText) dataFeedText.textContent='⚠️ Fonte temporariamente indisponível • fallback automático em andamento';
     }
