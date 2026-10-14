@@ -391,16 +391,7 @@ def scalping_m1_claim(result, symbol, market):
 PWA_VERSION = "v229"
 
 # ===== MEGA IA PROFESSOR / CLIENTE =====
-# Papel automático: evita que o serviço Parceiro consulte o banco local vazio
-# quando MEGA_APP_ROLE não foi configurado no Render.
-_role_env = (os.getenv("MEGA_APP_ROLE") or os.getenv("APP_ROLE") or "").strip().upper()
-_render_service = (os.getenv("RENDER_SERVICE_NAME") or "").strip().lower()
-if _role_env in ("PROFESSOR", "PARTNER", "PARCEIRO", "CLIENT", "CLIENTE"):
-    APP_ROLE = "PROFESSOR" if _role_env == "PROFESSOR" else "PARTNER"
-elif _render_service:
-    APP_ROLE = "PROFESSOR" if ("professor" in _render_service or "master" in _render_service) else "PARTNER"
-else:
-    APP_ROLE = "PROFESSOR"
+APP_ROLE = os.getenv("MEGA_APP_ROLE", os.getenv("APP_ROLE", "PROFESSOR")).strip().upper()
 CLIENT_HIDE_ENGINES = os.getenv("MEGA_CLIENT_HIDE_ENGINES", "1").strip().lower() not in ("0", "false", "off", "no")
 MASTER_SERVER_URL = os.getenv("MEGA_MASTER_SERVER_URL", "https://mega-ia-professor.onrender.com").strip().rstrip("/")
 PARTNER_APP_URL = os.getenv("MEGA_PARTNER_APP_URL", "https://mega-ia-2-0.onrender.com").strip().rstrip("/")
@@ -35058,16 +35049,7 @@ async def _client_remote_status(key: str, device: str = "", claim: bool = False)
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
             r=(await client.post(MASTER_SERVER_URL+"/license/claim",json={"key":key,"device":device})) if claim else (await client.get(MASTER_SERVER_URL+"/license/validate",params={"key":key,"device":device}))
-            if r.status_code == 200:
-                data = r.json()
-            else:
-                detail = ""
-                try:
-                    payload = r.json()
-                    detail = str(payload.get("detail") or payload.get("reason") or "") if isinstance(payload, dict) else ""
-                except Exception:
-                    detail = (r.text or "")[:160]
-                data = {"valid": False, "reason": f"Professor recusou a validação (HTTP {r.status_code})" + (f": {detail}" if detail else ".")}
+            data=r.json() if r.status_code==200 else {"valid":False,"reason":f"Professor recusou a validação (HTTP {r.status_code})."}
     except Exception as exc:
         print(f"[LICENCA] Falha de comunicação com Professor: {type(exc).__name__}", flush=True)
         return {"valid":False,"reason":"Não foi possível validar com o Professor."}
@@ -45823,7 +45805,8 @@ async def home(request: Request):
     # mesmo se outro middleware/roteamento for alterado no futuro.
     if APP_ROLE in ("CLIENT", "PARTNER"):
         key = request.cookies.get(LICENSE_COOKIE, "")
-        st = await _client_remote_status(key)
+        device = request.cookies.get(LICENSE_DEVICE_COOKIE, "")
+        st = await _client_remote_status(key, device)
         if not st.get("valid"):
             return HTMLResponse(
                 LICENSE_PAGE.replace("__ERROR__", f'<div class="err">{st.get("reason", "")}</div>'),
