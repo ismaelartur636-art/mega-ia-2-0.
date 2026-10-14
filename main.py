@@ -874,18 +874,8 @@ async def partner_license_status(request: Request):
 
 @app.middleware("http")
 async def mega_professor_license_guard(request: Request, call_next):
-    path=request.url.path
-    public_paths={"/health","/license/activate","/license/status","/manifest.webmanifest","/app-icon.png","/app-icon-192-v2.png","/app-icon-512-v2.png","/app-icon-192-v3.png","/app-icon-512-v3.png","/app-icon-192-v4.png","/app-icon-512-v4.png","/app-icon-192-v5.png","/app-icon-512-v5.png","/app-icon-192-v6.png","/app-icon-512-v6.png","/service-worker.js"}
-    if path in public_paths or path.startswith("/docs") or path.startswith("/openapi"):
-        return await call_next(request)
-    key=request.cookies.get(PARTNER_LICENSE_COOKIE,"")
-    device=request.cookies.get(PARTNER_DEVICE_COOKIE,"")
-    status=await _partner_remote_license(key,device)
-    if not status.get("valid"):
-        if request.method in ("GET","HEAD") and path=="/":
-            message=html.escape(str(status.get("reason") or ""))
-            return HTMLResponse(PARTNER_LICENSE_PAGE.replace("__ERROR__",f'<div class="err">{message}</div>'))
-        return JSONResponse({"detail":"APP BLOQUEADO PELO MEGA PROFESSOR","license":status},status_code=403)
+    # MODO DE TESTE: trava de senha/licença temporariamente desativada.
+    # Não altera a conexão IQ Option, sinais, setas ou horários de entrada.
     return await call_next(request)
 
 @app.get("/manifest.webmanifest")
@@ -946,7 +936,7 @@ def app_icon_512_v6():
 
 @app.get("/service-worker.js")
 def app_service_worker():
-    worker = """const CACHE = "mega-ia-2-shell-v6";
+    worker = """const CACHE = "mega-ia-2-shell-v7-test-livre";
 self.addEventListener("install", event => event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(["/", "/manifest.webmanifest", "/app-icon-192-v6.png", "/app-icon-512-v6.png"])).then(() => self.skipWaiting())));
 self.addEventListener("activate", event => event.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(key => key !== CACHE).map(key => caches.delete(key)))).then(() => self.clients.claim())));
 self.addEventListener("fetch", event => {
