@@ -45805,8 +45805,8 @@ async def home(request: Request):
     # mesmo se outro middleware/roteamento for alterado no futuro.
     if APP_ROLE in ("CLIENT", "PARTNER"):
         key = request.cookies.get(LICENSE_COOKIE, "")
-        st = await _client_remote_status(key, request.cookies.get(LICENSE_DEVICE_COOKIE, ""))
-        if not st.get("valid"): 
+        st = await _client_remote_status(key)
+        if not st.get("valid"):
             return HTMLResponse(
                 LICENSE_PAGE.replace("__ERROR__", f'<div class="err">{st.get("reason", "")}</div>'),
                 status_code=200,
