@@ -1,4 +1,3 @@
-cat > main.py <<'PY'
 """MEGA IA Parceiro 2.0 - projeto novo, motor Scalping M1 FLEX."""
 import os, time, secrets, threading, logging, random
 from datetime import datetime
