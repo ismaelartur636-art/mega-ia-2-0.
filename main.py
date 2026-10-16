@@ -499,4 +499,3 @@ def health():return {'ok':True,'version':'2.0.0','iq_library':IQ_Option is not N
 @app.get('/',response_class=HTMLResponse)
 def index():
     with open(os.path.join(os.path.dirname(__file__),'index.html'),encoding='utf8') as f:return HTMLResponse(f.read())
-PY
