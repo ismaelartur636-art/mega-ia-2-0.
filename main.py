@@ -1,6 +1,7 @@
+cat > main.py <<'PY'
 """MEGA IA Parceiro 2.0 - projeto novo, motor Scalping M1 FLEX."""
-import os, time, secrets, threading, logging
-from datetime import datetime, timezone
+import os, time, secrets, threading, logging, random
+from datetime import datetime
 from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -21,6 +22,15 @@ LOGIN_TIMEOUT = max(15, min(60, int(os.getenv("IQ_CONNECT_TIMEOUT", "35"))))
 IQ_RECONNECT_LOCK = threading.RLock()
 MIN_CANDLES = 75
 PAIRS = {"EUR/USD":"EURUSD", "GBP/USD":"GBPUSD", "USD/JPY":"USDJPY", "EUR/JPY":"EURJPY", "GBP/JPY":"GBPJPY", "AUD/USD":"AUDUSD", "USD/CAD":"USDCAD"}
+
+# Previne vários logins concorrentes para o mesmo email
+_CONNECTING_EMAILS = set()
+_CONNECTING_EMAILS_LOCK = threading.RLock()
+
+# Background retry parameters
+BG_MAX_RETRIES = int(os.getenv("IQ_BG_MAX_RETRIES", "4"))
+BG_INITIAL_BACKOFF = float(os.getenv("IQ_BG_INITIAL_BACKOFF", "1.0"))
+BG_MAX_BACKOFF = float(os.getenv("IQ_BG_MAX_BACKOFF", "30.0"))
 
 class Login(BaseModel):
     email: str
@@ -63,22 +73,201 @@ def login_blocking(email,password):
     if not iq.check_connect():raise RuntimeError("IQ Option não confirmou o WebSocket.")
     return iq
 
+def _background_connect_task(token):
+    with LOCK:
+        s = SESSIONS.get(token)
+    if not s:
+        return
+
+    email = s.get("email")
+    password = s.get("password")
+
+    with _CONNECTING_EMAILS_LOCK:
+        _CONNECTING_EMAILS.add(email)
+
+    backoff = BG_INITIAL_BACKOFF
+    for attempt in range(1, BG_MAX_RETRIES + 1):
+        with LOCK:
+            s = SESSIONS.get(token)
+            if not s:
+                break
+            s["state"] = "connecting"
+            s["last_error"] = ""
+            s["last_reconnect_attempt"] = time.time()
+        try:
+            LOG.info("[IQ CONNECT BG] tentativa %d para %s", attempt, email)
+            iq = call_timeout(login_blocking, email, password, seconds=LOGIN_TIMEOUT)
+            with LOCK:
+                s = SESSIONS.get(token)
+                if not s:
+                    try: iq.close_connect()
+                    except Exception: pass
+                    break
+                s["iq"] = iq
+                s["state"] = "connected"
+                s["last_error"] = ""
+                s["reconnect_failures"] = 0
+                s["reconnecting"] = False
+            LOG.info("[IQ CONNECT BG] conectado com sucesso %s", email)
+            break
+        except Exception as exc:
+            msg = str(exc)[:200]
+            LOG.warning("[IQ CONNECT BG] falha: %s", msg)
+            with LOCK:
+                s = SESSIONS.get(token)
+                if s:
+                    s["last_error"] = msg
+                    s["state"] = "failed"
+                    s["reconnecting"] = False
+                    s["reconnect_failures"] = int(s.get("reconnect_failures", 0)) + 1
+
+            if "429" in msg or "Too Many Requests" in msg:
+                backoff = min(BG_MAX_BACKOFF, backoff * 2.5)
+            else:
+                backoff = min(BG_MAX_BACKOFF, backoff * 2)
+
+            jitter = random.uniform(0.8, 1.2)
+            time.sleep(max(0.5, backoff * jitter))
+
+    with _CONNECTING_EMAILS_LOCK:
+        try:
+            _CONNECTING_EMAILS.discard(email)
+        except Exception:
+            pass
+
+def _reconnect_background_worker(token):
+    with LOCK:
+        s = SESSIONS.get(token)
+    if not s:
+        return
+
+    email = s.get("email")
+    password = s.get("password")
+
+    with _CONNECTING_EMAILS_LOCK:
+        if email in _CONNECTING_EMAILS:
+            return
+        _CONNECTING_EMAILS.add(email)
+
+    backoff = BG_INITIAL_BACKOFF
+    for attempt in range(1, BG_MAX_RETRIES + 1):
+        with LOCK:
+            s = SESSIONS.get(token)
+            if not s:
+                break
+            s["state"] = "connecting"
+            s["reconnecting"] = True
+            s["last_reconnect_attempt"] = time.time()
+        try:
+            LOG.warning("[IQ RECONNECT BG] tentativa %d para %s", attempt, email)
+            iq = call_timeout(login_blocking, email, password, seconds=LOGIN_TIMEOUT)
+            with LOCK:
+                s = SESSIONS.get(token)
+                if not s:
+                    try: iq.close_connect()
+                    except Exception: pass
+                    break
+                old_iq = s.get("iq")
+                if old_iq and old_iq is not iq:
+                    try:
+                        t = threading.Thread(target=lambda x: (getattr(x, "close_connect", None) or getattr(x, "close", None) or getattr(x, "disconnect", None))(), args=(old_iq,), daemon=True)
+                        t.start()
+                    except Exception:
+                        pass
+                s["iq"] = iq
+                s["state"] = "connected"
+                s["last_error"] = ""
+                s["reconnect_failures"] = 0
+                s["reconnecting"] = False
+            LOG.info("[IQ RECONNECT BG] reconectado com sucesso %s", email)
+            break
+        except Exception as exc:
+            msg = str(exc)[:200]
+            LOG.warning("[IQ RECONNECT BG] falha: %s", msg)
+            with LOCK:
+                s = SESSIONS.get(token)
+                if s:
+                    s["last_error"] = msg
+                    s["state"] = "failed"
+                    s["reconnecting"] = False
+                    s["reconnect_failures"] = int(s.get("reconnect_failures", 0)) + 1
+
+            if "429" in msg or "Too Many Requests" in msg:
+                backoff = min(BG_MAX_BACKOFF, backoff * 2.5)
+            else:
+                backoff = min(BG_MAX_BACKOFF, backoff * 2)
+
+            jitter = random.uniform(0.8, 1.2)
+            time.sleep(max(0.5, backoff * jitter))
+
+    with _CONNECTING_EMAILS_LOCK:
+        try:
+            _CONNECTING_EMAILS.discard(email)
+        except Exception:
+            pass
+
+def ensure_iq_connected(s, token=None):
+    """Verifica o socket e, se cair, agenda reconexão em background sem bloquear request."""
+    iq_client = s.get("iq")
+    if iq_client:
+        try:
+            if call_timeout(iq_client.check_connect, seconds=3):
+                s["last_error"] = ""
+                s["state"] = "connected"
+                return iq_client
+        except Exception:
+            pass
+
+    if s.get("reconnecting"):
+        raise RuntimeError("Reconexão da IQ Option já está em andamento.")
+
+    now = time.time()
+    wait_until = float(s.get("last_reconnect_attempt", 0)) + min(30, 2 ** min(int(s.get("reconnect_failures", 0)), 5))
+    if now < wait_until:
+        raise RuntimeError(f"IQ Option reconectando; nova tentativa em {int(wait_until-now)+1}s.")
+
+    with LOCK:
+        s["reconnecting"] = True
+        s["last_reconnect_attempt"] = now
+        s["state"] = "connecting"
+
+    if token:
+        threading.Thread(target=_reconnect_background_worker, args=(token,), daemon=True, name="mega-iq-reconnect").start()
+    raise RuntimeError("Reconexão iniciada em segundo plano. Verifique /iq-status.")
+
 @app.post('/iq-login')
 def iq_login(body: Login):
     if IQ_Option is None:raise HTTPException(503,"Biblioteca iqoptionapi não instalada no servidor.")
-    try:
-        iq=call_timeout(login_blocking,body.email,body.password,seconds=LOGIN_TIMEOUT)
-    except TimeoutError:
-        LOG.warning("[IQ CONNECTOR] timeout de %ss na autenticação/WebSocket",LOGIN_TIMEOUT)
-        raise HTTPException(504,f"IQ Option não respondeu em {LOGIN_TIMEOUT}s. O servidor poderá tentar novamente; confira a rede e os logs.")
-    except Exception as exc:
-        LOG.warning("[IQ CONNECTOR] login falhou: %s",type(exc).__name__)
-        raise HTTPException(502,"Falha na conexão IQ: "+str(exc)[:170])
-    token=secrets.token_urlsafe(40)
+    email = body.email.strip().lower()
+    password = body.password
+
+    with _CONNECTING_EMAILS_LOCK:
+        if email in _CONNECTING_EMAILS:
+            raise HTTPException(429, "Conexão para este e-mail já está em andamento. Aguarde e verifique /iq-status.")
+
+    token = secrets.token_urlsafe(40)
     with LOCK:
-        SESSIONS[token]={"iq":iq,"email":body.email,"password":body.password,"created":time.time(),"mode":"RECOVERY","last_signal":{},"active":{},"history":[],"last_poll":{},"last_error":"","reconnecting":False,"last_reconnect_attempt":0.0}
-    response=JSONResponse({"connected":True,"message":"IQ Option conectada"})
-    response.set_cookie("mega_iq_session",token,httponly=True,secure=True,samesite="lax",max_age=SESSION_TTL)
+        SESSIONS[token] = {
+            "iq": None,
+            "email": email,
+            "password": password,
+            "created": time.time(),
+            "mode": "RECOVERY",
+            "last_signal": {},
+            "active": {},
+            "history": [],
+            "last_poll": {},
+            "last_error": "",
+            "reconnecting": True,
+            "last_reconnect_attempt": 0.0,
+            "reconnect_failures": 0,
+            "state": "connecting"
+        }
+
+    threading.Thread(target=_background_connect_task, args=(token,), daemon=True, name="mega-iq-bg-connect").start()
+
+    response = JSONResponse({"connected": False, "message": "Conectando em segundo plano. Verifique /iq-status"})
+    response.set_cookie("mega_iq_session", token, httponly=True, secure=True, samesite="lax", max_age=SESSION_TTL)
     return response
 
 @app.post('/iq-logout')
@@ -86,72 +275,52 @@ def iq_logout(request:Request):
     token=request.cookies.get("mega_iq_session","")
     with LOCK:s=SESSIONS.pop(token,None)
     if s:
-        try:s["iq"].close_connect()
-        except Exception:pass
+        try:
+            iq=s.get("iq")
+            if iq:
+                for method_name in ("close_connect","close","disconnect"):
+                    fn = getattr(iq, method_name, None)
+                    if callable(fn):
+                        try:
+                            fn()
+                        except Exception:
+                            pass
+                        break
+        except Exception:
+            pass
     response=JSONResponse({"connected":False})
     response.delete_cookie("mega_iq_session")
     return response
 
-def ensure_iq_connected(s):
-    """Verifica o socket e tenta restabelecer a sessão quando a conexão cai."""
-    try:
-        if call_timeout(s["iq"].check_connect, seconds=3):
-            s["last_error"] = ""
-            return s["iq"]
-    except Exception:
-        pass
-    with IQ_RECONNECT_LOCK:
-        # Outra requisição pode ter reconectado enquanto esta aguardava o lock.
-        try:
-            if call_timeout(s["iq"].check_connect, seconds=3):
-                s["last_error"] = ""
-                return s["iq"]
-        except Exception:
-            pass
-        now = time.time()
-        if s.get("reconnecting"):
-            raise RuntimeError("Reconexão da IQ Option já está em andamento.")
-        wait_until = float(s.get("last_reconnect_attempt", 0)) + min(30, 2 ** min(int(s.get("reconnect_failures", 0)), 5))
-        if now < wait_until:
-            raise RuntimeError(f"IQ Option reconectando; nova tentativa em {int(wait_until-now)+1}s.")
-        s["reconnecting"] = True
-        s["last_reconnect_attempt"] = now
-        try:
-            LOG.warning("[IQ RECONNECT] socket desconectado; iniciando nova autenticação")
-            new_iq = call_timeout(login_blocking, s["email"], s["password"], seconds=LOGIN_TIMEOUT)
-            old_iq = s.get("iq")
-            s["iq"] = new_iq
-            s["reconnect_failures"] = 0
-            s["last_error"] = ""
-            try:
-                if old_iq is not new_iq:
-                    threading.Thread(target=old_iq.close_connect, daemon=True).start()
-            except Exception:
-                pass
-            LOG.info("[IQ RECONNECT] WebSocket restabelecido")
-            return new_iq
-        except Exception as exc:
-            s["reconnect_failures"] = int(s.get("reconnect_failures", 0)) + 1
-            s["last_error"] = str(exc)[:150]
-            LOG.warning("[IQ RECONNECT] falha %s: %s", s["reconnect_failures"], s["last_error"])
-            raise RuntimeError("Falha na reconexão automática da IQ Option: " + s["last_error"])
-        finally:
-            s["reconnecting"] = False
-
 @app.get('/iq-status')
 def iq_status(request:Request):
     s=session(request,False)
-    if not s:return {"connected":False,"source":"NONE"}
+    if not s:
+        return {"connected":False,"source":"NONE","state":"disconnected","error":"","reconnecting":False}
+    token = request.cookies.get("mega_iq_session","")
     try:
-        ensure_iq_connected(s)
-        connected=True
+        ensure_iq_connected(s, token=token)
+        connected = True
     except Exception as exc:
-        connected=False
+        connected = False
         s["last_error"] = str(exc)[:150]
-    return {"connected":connected,"source":"IQ_OPTION" if connected else "NONE","error":s.get("last_error", ""),"reconnecting":bool(s.get("reconnecting"))}
+    return {
+        "connected": connected,
+        "source": "IQ_OPTION" if connected else "NONE",
+        "error": s.get("last_error", ""),
+        "reconnecting": bool(s.get("reconnecting")),
+        "state": s.get("state", "unknown")
+    }
 
 def fetch_candles(s,symbol,count=180):
-    iq=ensure_iq_connected(s)
+    iq = s.get("iq")
+    if not iq:
+        raise RuntimeError("IQ Option não conectada.")
+    try:
+        if not call_timeout(iq.check_connect, seconds=3):
+            raise RuntimeError("IQ Option sem socket ativo.")
+    except Exception:
+        raise RuntimeError("IQ Option sem socket ativo.")
     code=PAIRS.get(symbol)
     if not code:raise ValueError("Par não permitido")
     raw=iq.get_candles(code,60,count,int(time.time()))
@@ -166,7 +335,6 @@ def fetch_candles(s,symbol,count=180):
     rows=[r for r in rows if r['timestamp']+60<=now-1]
     if len(rows)<MIN_CANDLES:raise RuntimeError("Não há 75 candles M1 fechados")
     if now-rows[-1]['timestamp']>180:raise RuntimeError("Candles IQ atrasados mais de 3 minutos")
-    # Bloqueia preenchimento de lacunas artificiais; intervalos sem dados não são inventados.
     recent=rows[-20:]
     if any(b['timestamp']-a['timestamp']!=60 for a,b in zip(recent,recent[1:])):
         raise RuntimeError("Candles IQ com lacunas nos últimos 20 minutos")
@@ -203,7 +371,6 @@ def scalping_m1_flex_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OP
                 try:return int(float(v)/1000 if float(v)>1e11 else float(v))
                 except ValueError:return int(datetime.fromisoformat(v.replace('Z','+00:00')).timestamp())
             raise ValueError('timestamp ausente')
-        # Reagrupa somente candles M1 efetivamente fechados; nunca usa vela futura.
         def aggregate(minutes):
             groups={}
             for row in rows:
@@ -220,8 +387,6 @@ def scalping_m1_flex_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OP
         if len(m15)<2 or len(m5)<3:return {**base,'reason':'Aguardando candles completos M15 e M5.'}
         now_bucket=ts(rows[-1])//60
         last=rows[-1];price=float(last['close']);rng=max(float(last['high'])-float(last['low']),1e-12)
-        # FLEX: rompimento confirmado M5 OU impulso M1 após rompimento recente.
-        # Somente candles fechados; M15 serve de contexto, não bloqueio obrigatório.
         recent_m5=m5[-4:]
         candidates=[]
         for i in range(1,len(recent_m5)):
@@ -233,7 +398,6 @@ def scalping_m1_flex_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OP
             if direction:candidates.append((cur['bucket'],direction,prev['high'] if direction=='CALL' else prev['low']))
         last_open=float(last['open']);last_high=float(last['high']);last_low=float(last['low'])
         body=abs(price-last_open)/rng
-        # Impulso de M1: rompe máxima/mínima das 5 velas anteriores.
         prior5=rows[-6:-1]
         high5=max(float(r['high']) for r in prior5)
         low5=min(float(r['low']) for r in prior5)
@@ -258,7 +422,6 @@ def scalping_m1_flex_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OP
     except Exception as exc:return {**base,'reason':f'Scalping M1 aguardando dados M1 válidos: {str(exc)[:90]}'}
 
 def settle(s,rows,symbol):
-    """Apuração virtual pelo candle de entrada; recuperação só avança em NOVO sinal."""
     chain=s['active'].get(symbol)
     if not chain or chain.get('pending') is None:return
     p=chain['pending']
@@ -283,7 +446,6 @@ def settle(s,rows,symbol):
 def maybe_register(s,symbol,decision,rows):
     if decision['direction'] not in ('CALL','PUT') or not decision.get('confirmed'):return decision
     stamp=rows[-1]['timestamp']
-    # Um evento por candle, com trava de 4 minutos entre entradas INICIAIS.
     event=(symbol,stamp,decision['direction'])
     if event in s['last_poll']:return {**decision,'reason':'Sinal já registrado neste candle','already_registered':True}
     chain=s['active'].get(symbol)
@@ -338,3 +500,4 @@ def health():return {'ok':True,'version':'2.0.0','iq_library':IQ_Option is not N
 @app.get('/',response_class=HTMLResponse)
 def index():
     with open(os.path.join(os.path.dirname(__file__),'index.html'),encoding='utf8') as f:return HTMLResponse(f.read())
+PY
