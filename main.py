@@ -794,6 +794,9 @@ def scalping_m1_flex_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OP
         return {**base,"reason":"Scalping M1 FLEX funciona no timeframe M1."}
     rows=list(cs or [])[-600:]
     if len(rows)<75:return {**base,"reason":"Aguardando pelo menos 75 candles M1."}
+    # Calcula o volume relativo/atividade antes da análise técnica. Sem isso,
+    # os retornos abaixo referenciavam volume_info inexistente e o painel ficava indisponível.
+    volume_info = analyze_relative_volume(rows, lookback=10, threshold=1.5)
     try:
         def ts(row):
             v=row.get('timestamp',row.get('time',row.get('datetime')))
