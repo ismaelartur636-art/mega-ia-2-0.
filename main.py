@@ -727,45 +727,63 @@ def candles(request:Request,symbol:str='EUR/USD',limit:int=10):
         raise HTTPException(503,"Fonte IQ indisponível: "+s['last_error'])
 
 def analyze_relative_volume(rows, lookback=10, threshold=1.5):
-    """Volume relativo baseado apenas nos volumes reais retornados pela fonte IQ."""
+    """Volume IQ quando disponível; caso contrário, estimativa transparente de atividade pelas velas.
+
+    OTC/forex podem não fornecer volume negociado real. Nesses casos usa amplitude e corpo
+    das velas como proxy de atividade, sem apresentar isso como volume real da corretora.
+    """
     base = {'volume_available': False, 'volume_ratio': None, 'volume_level': 'INDISPONÍVEL',
-            'volume_direction': 'NEUTRO', 'volume_threshold': threshold,
-            'volume_message': 'Volume não fornecido pela fonte; estratégia original preservada.'}
+            'volume_direction': 'NEUTRO', 'volume_threshold': threshold, 'volume_source': 'NONE',
+            'volume_message': 'Aguardando candles válidos para calcular atividade.'}
     if not rows or len(rows) < lookback + 1:
         return base
-    values = []
+    raw_values = []
     for row in rows:
-        try: values.append(max(0.0, float(row.get('volume') or 0.0)))
-        except (TypeError, ValueError): values.append(0.0)
-    current = values[-1]
-    prior = values[-lookback-1:-1]
-    valid_prior = [v for v in prior if v > 0]
+        try: raw_values.append(max(0.0, float(row.get('volume') or 0.0)))
+        except (TypeError, ValueError): raw_values.append(0.0)
+    valid_prior = [v for v in raw_values[-lookback-1:-1] if v > 0]
+    current = raw_values[-1]
+    source = 'IQ_REAL'
+    values = raw_values
     if current <= 0 or len(valid_prior) < max(5, lookback // 2):
-        return base
-    average = sum(valid_prior) / len(valid_prior)
-    if average <= 0:
-        return base
+        # Proxy de atividade para OTC: amplitude da vela ponderada pela proporção do corpo.
+        # Não representa volume negociado real.
+        activity = []
+        for row in rows:
+            try:
+                op, hi, lo, cl = (float(row[k]) for k in ('open', 'high', 'low', 'close'))
+                candle_range = max(hi - lo, abs(op) * 1e-8, 1e-12)
+                body_share = min(1.0, abs(cl - op) / candle_range)
+                activity.append(candle_range * (0.35 + 0.65 * body_share))
+            except (KeyError, TypeError, ValueError): activity.append(0.0)
+        values = activity
+        source = 'ESTIMADO_PELAS_VELAS'
+    current = values[-1]
+    prior = [v for v in values[-lookback-1:-1] if v > 0]
+    if current <= 0 or len(prior) < max(5, lookback // 2): return base
+    average = sum(prior) / len(prior)
+    if average <= 0: return base
     ratio = current / average
     last = rows[-1]
     try:
         op, cl = float(last['open']), float(last['close'])
         direction = 'CALL' if cl > op else 'PUT' if cl < op else 'NEUTRO'
-    except (KeyError, TypeError, ValueError):
-        direction = 'NEUTRO'
-    high = ratio >= threshold
-    very_high = ratio >= 2.0
-    if high and direction == 'CALL':
-        msg = 'Detectamos uma grande quantidade de volume de compra. Aguarde o sinal.'
-    elif high and direction == 'PUT':
-        msg = 'Detectamos uma grande quantidade de volume de venda. Aguarde o sinal.'
-    elif high:
-        msg = 'Volume muito alto detectado, mas sem direção clara. Aguarde o sinal.'
+    except (KeyError, TypeError, ValueError): direction = 'NEUTRO'
+    high, very_high = ratio >= threshold, ratio >= 2.0
+    if source == 'ESTIMADO_PELAS_VELAS':
+        if high and direction == 'CALL': msg = 'Atividade estimada pelas velas: movimento comprador elevado; não é volume negociado real.'
+        elif high and direction == 'PUT': msg = 'Atividade estimada pelas velas: movimento vendedor elevado; não é volume negociado real.'
+        elif high: msg = 'Atividade estimada elevada, sem direção clara; não é volume negociado real.'
+        else: msg = 'Atividade estimada pelas velas dentro da faixa habitual; não é volume real.'
     else:
-        msg = 'Volume dentro da faixa habitual; aguardando confirmação.'
+        if high and direction == 'CALL': msg = 'Volume informado pela IQ elevado na vela compradora.'
+        elif high and direction == 'PUT': msg = 'Volume informado pela IQ elevado na vela vendedora.'
+        elif high: msg = 'Volume informado pela IQ elevado, sem direção clara.'
+        else: msg = 'Volume informado pela IQ dentro da faixa habitual.'
     return {'volume_available': True, 'volume_ratio': round(ratio, 2),
             'volume_level': 'MUITO ALTO' if very_high else 'ALTO' if high else 'NORMAL',
             'volume_direction': direction, 'volume_threshold': threshold,
-            'volume_message': msg}
+            'volume_source': source, 'volume_message': msg}
 
 # Único indicador preservado do aplicativo anterior: Scalping M1 FLEX.
 _SCALPINGM1_LOCK=threading.RLock()
