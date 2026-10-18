@@ -706,7 +706,7 @@ def iq_login(body: Login, request: Request):
             raise HTTPException(504, "A tentativa IQ expirou.")
         token = secrets.token_urlsafe(40)
         with LOCK:
-            SESSIONS[token] = {"iq": iq, "email": body.email.strip().casefold(), "created": time.time(), "mode": "RECOVERY", "entry_amount": 5.0, "recovery_amount": 5.0, "last_signal": {}, "active": {}, "history": [], "last_poll": {}, "last_error": "", "bankroll_start": 100.0, "bankroll": 100.0, "bank_payout": 85.0, "bank_ledger": [], "finance_initial": 50.0, "finance_next": 50.0, "finance_loss_streak": 0, "finance_wins": 0, "finance_losses": 0, "finance_last_status": "Finanças prontas • aguardando resultado", "finance_enabled": True}
+            SESSIONS[token] = {"iq": iq, "email": body.email.strip().casefold(), "created": time.time(), "mode": "RECOVERY", "entry_amount": 5.0, "recovery_amount": 5.0, "last_signal": {}, "active": {}, "history": [], "last_poll": {}, "last_error": "", "bankroll_start": 100.0, "bankroll": 100.0, "bank_payout": 85.0, "bank_ledger": [], "finance_initial": 50.0, "finance_next": 50.0, "finance_loss_streak": 0, "finance_wins": 0, "finance_losses": 0, "finance_last_status": "Finanças prontas • aguardando resultado", "finance_enabled": True, "reconnect_lock": threading.Lock(), "connection_state": "connected", "last_reconnect_attempt": 0}
         response = JSONResponse({"connected": True, "message": "IQ Option conectada"})
         response.set_cookie("mega_iq_session", token, httponly=True, secure=True, samesite="lax", max_age=SESSION_TTL)
         return response
@@ -729,21 +729,86 @@ def iq_logout(request:Request):
     response.delete_cookie("mega_iq_session")
     return response
 
+def ensure_iq_connected(s, *, reconnect=True):
+    """Confere a sessão IQ e tenta recuperar o WebSocket se a sessão existir."""
+    iq = s.get("iq")
+    if iq is None:
+        return False
+    try:
+        if bool(call_timeout(iq.check_connect, seconds=3)):
+            s["connection_checked_at"] = time.time()
+            s["connection_state"] = "connected"
+            return True
+    except Exception as exc:
+        s["connection_check_error"] = type(exc).__name__
+
+    if not reconnect:
+        s["connection_state"] = "websocket_unavailable"
+        return False
+
+    # Não chamar connect() em cada polling: limitar tentativas de reconexão.
+    now = time.time()
+    with s.setdefault("reconnect_lock", threading.Lock()):
+        now = time.time()
+        last = float(s.get("last_reconnect_attempt", 0) or 0)
+        if now - last < 12:
+            s["connection_state"] = "reconnecting"
+            return False
+        s["last_reconnect_attempt"] = now
+        s["connection_state"] = "reconnecting"
+        try:
+            result = call_timeout(iq.connect, seconds=10)
+            ok, _reason = parse_iq_connect_result(result)
+            if ok and bool(call_timeout(iq.check_connect, seconds=3)):
+                s["connection_checked_at"] = time.time()
+                s["connection_state"] = "connected"
+                s["last_error"] = ""
+                LOG.info("[IQ CONNECTOR] WebSocket recuperado automaticamente")
+                return True
+            s["connection_state"] = "websocket_unavailable"
+        except Exception as exc:
+            s["connection_state"] = "websocket_unavailable"
+            s["connection_check_error"] = type(exc).__name__
+            LOG.warning("[IQ CONNECTOR] reconexão automática falhou: %s", type(exc).__name__)
+    return False
+
 @app.get('/iq-status')
 def iq_status(request:Request):
     s=session(request,False)
-    if not s:return {"connected":False,"source":"NONE"}
-    try:connected=bool(call_timeout(s["iq"].check_connect,seconds=3))
-    except Exception:connected=False
-    return {"connected":connected,"source":"IQ_OPTION" if connected else "NONE","error":s["last_error"]}
+    if not s:return {"connected":False,"session":False,"data_connected":False,"source":"NONE","state":"no_session"}
+    # A sessão autenticada e a saúde do WebSocket são estados diferentes.
+    # O radar não deve declarar logout só porque check_connect() falhou momentaneamente.
+    try:
+        data_connected = bool(call_timeout(s["iq"].check_connect, seconds=3))
+    except Exception:
+        data_connected = False
+    if data_connected:
+        s["connection_state"] = "connected"
+    elif s.get("connection_state") != "reconnecting":
+        s["connection_state"] = "session_active_data_check_needed"
+    return {"connected":True,"session":True,"data_connected":data_connected,
+            "source":"IQ_OPTION","state":s.get("connection_state", "unknown"),
+            "error":s.get("last_error", "")}
 
 def fetch_candles(s,symbol,count=180,candle_seconds=60):
     iq=s['iq']
-    if not iq.check_connect():raise RuntimeError("WebSocket IQ desconectado. Faça novo login.")
     asset=resolve_iq_asset(s,symbol)
     code=asset["code"]
-    with s.setdefault("data_lock", threading.RLock()):
-        raw=iq.get_candles(code,int(candle_seconds),count,int(time.time()))
+    # Tenta obter candles primeiro: em algumas versões, check_connect() fica falso
+    # mesmo quando a chamada de dados ainda funciona. Só reconecta após falha real.
+    try:
+        with s.setdefault("data_lock", threading.RLock()):
+            raw=iq.get_candles(code,int(candle_seconds),count,int(time.time()))
+    except Exception as first_error:
+        if not ensure_iq_connected(s, reconnect=True):
+            raise RuntimeError("Sessão IQ autenticada, mas a fonte de candles não respondeu (" + type(first_error).__name__ + "). Tentando recuperar o WebSocket.") from None
+        with s.setdefault("data_lock", threading.RLock()):
+            raw=iq.get_candles(code,int(candle_seconds),count,int(time.time()))
+    if not raw or len(raw)<MIN_CANDLES:
+        # Resposta vazia também pode indicar WebSocket preso, sem lançar exceção.
+        if ensure_iq_connected(s, reconnect=True):
+            with s.setdefault("data_lock", threading.RLock()):
+                raw=iq.get_candles(code,int(candle_seconds),count,int(time.time()))
     if not raw or len(raw)<MIN_CANDLES:raise RuntimeError(f"IQ retornou poucos candles {int(candle_seconds)//60}M")
     rows=[]
     for c in raw:
