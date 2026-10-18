@@ -799,11 +799,14 @@ def fetch_candles(s,symbol,count=180,candle_seconds=60):
     try:
         with s.setdefault("data_lock", threading.RLock()):
             raw=iq.get_candles(code,int(candle_seconds),count,int(time.time()))
+        LOG.info("[IQ CANDLES] ativo=%s codigo=%s periodo=%s quantidade=%s", symbol, code, candle_seconds, len(raw) if raw else 0)
     except Exception as first_error:
+        LOG.warning("[IQ CANDLES] primeira consulta falhou ativo=%s codigo=%s periodo=%s erro=%s", symbol, code, candle_seconds, type(first_error).__name__)
         if not ensure_iq_connected(s, reconnect=True):
             raise RuntimeError("Sessão IQ autenticada, mas a fonte de candles não respondeu (" + type(first_error).__name__ + "). Tentando recuperar o WebSocket.") from None
         with s.setdefault("data_lock", threading.RLock()):
             raw=iq.get_candles(code,int(candle_seconds),count,int(time.time()))
+        LOG.info("[IQ CANDLES] segunda consulta ativo=%s codigo=%s quantidade=%s", symbol, code, len(raw) if raw else 0)
     if not raw or len(raw)<MIN_CANDLES:
         # Resposta vazia também pode indicar WebSocket preso, sem lançar exceção.
         if ensure_iq_connected(s, reconnect=True):
@@ -1037,6 +1040,7 @@ def signal(request:Request,symbol:str='EUR/USD',interval:str='5min',indicators:b
         return {'server_time':time.time(),'ok':True,'source':'IQ_OPTION','symbol':symbol,'candle_timestamp':rows[-1]['timestamp'],**result}
     except Exception as exc:
         s['last_error']=str(exc)[:150]
+        LOG.warning("[IQ SIGNAL] sem candles válidos ativo=%s intervalo=%s erro=%s detalhe=%s", symbol, interval, type(exc).__name__, s['last_error'])
         return {'ok':False,'source':'NONE','direction':'NEUTRO','confidence':0,'reason':'AGUARDANDO DADOS: '+s['last_error']}
 
 def daily_performance_stats(history):
